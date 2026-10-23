@@ -223,13 +223,20 @@ SELECT
        WHEN price_gbp < 40 THEN 'Mid'        -- £25, £30
        WHEN price_gbp < 60 THEN 'High'       -- £50
        ELSE 'Very High' END                          AS tier_band,  -- £75
+  CASE
+    WHEN price_gbp IN (10, 15) THEN 'Bronze'
+    WHEN price_gbp IN (20, 25, 30) THEN 'Silver'
+    WHEN price_gbp IN (35, 50) THEN 'Gold'
+    WHEN price_gbp IN (55, 75) THEN 'Platinum'
+    ELSE 'Other'
+  END                                                AS tier_name,
   FALSE                                              AS is_unknown_member,
   CURRENT_TIMESTAMP()                                AS loaded_at
 FROM m
 UNION ALL
 SELECT 'UNKNOWN', 'Unknown tier', CAST(NULL AS NUMERIC), CAST(NULL AS STRING),
        CAST(NULL AS INT64), CAST(NULL AS INT64), CAST(NULL AS BOOL), CAST(NULL AS BOOL),
-       CAST(NULL AS TIMESTAMP), 'Unknown', TRUE, CURRENT_TIMESTAMP();
+       CAST(NULL AS TIMESTAMP), 'Unknown', 'Other', TRUE, CURRENT_TIMESTAMP();
 -- If the UNKNOWN row errors on a type (e.g. bonus_tickets not INT64), change
 -- only that CAST to match the source type.
 
@@ -784,6 +791,48 @@ WHERE rn = 1;
 
 
 -- =====================================================================
+-- =====================================================================
+-- SECTION 8g — fact_transaction_touch  (replaces fact_transaction_attribution)
+-- First-touch and last-touch attribution URLs and timestamps per transaction.
+-- =====================================================================
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.fact_transaction_touch`
+PARTITION BY purchase_date
+CLUSTER BY customer_key
+OPTIONS (description = "First-touch and last-touch attribution URLs and timestamps per transaction, built directly from raw source tables. Replaces rh_warehouse.fact_transaction_attribution.")
+AS
+SELECT
+  t.transaction_id,
+  IF(c.customer_id IS NULL, 'UNKNOWN_DELETED', t.customer_id) AS customer_key,
+  DATE(COALESCE(t.purchase_date, t.created_at)) AS purchase_date,
+  COALESCE(t.purchase_date, t.created_at) AS purchase_at,
+  t.subscription_id AS subscription_key,
+  t.order_type,
+  t.payment_status,
+  CASE
+    WHEN t.subscription_id IS NOT NULL AND s.subscription_id IS NOT NULL
+      THEN 'inherited_from_subscription_signup'
+    WHEN t.subscription_id IS NOT NULL
+      THEN 'orphan_subscription_own_touch'
+    ELSE 'transaction_own_touch'
+  END AS attribution_basis,
+  COALESCE(s.attribution_first_touch,           t.attribution_first_touch)           AS first_touch_url,
+  COALESCE(s.attribution_first_touch_timestamp, t.attribution_first_touch_timestamp) AS first_touch_timestamp,
+  COALESCE(s.attribution_last_touch,            t.attribution_last_touch)            AS last_touch_url,
+  COALESCE(s.attribution_last_touch_timestamp,  t.attribution_last_touch_timestamp)  AS last_touch_timestamp,
+  COALESCE(s.attribution_ga_client_id,          t.attribution_ga_client_id)          AS ga_client_id,
+  t.attribution_first_touch           AS payment_touch_first_url,
+  t.attribution_first_touch_timestamp AS payment_touch_first_timestamp,
+  t.attribution_last_touch            AS payment_touch_last_url,
+  t.attribution_last_touch_timestamp  AS payment_touch_last_timestamp,
+  t.attribution_ga_client_id          AS payment_touch_ga_client_id,
+  CURRENT_TIMESTAMP()                 AS loaded_at
+FROM `rh-ga4-491819.rh_warehouse.fact_transactions` t
+LEFT JOIN `rh-ga4-491819.rh_warehouse.fact_subscriptions` s
+  ON t.subscription_id = s.subscription_id
+LEFT JOIN `rh-ga4-491819.rh_warehouse.dim_customers` c
+  ON t.customer_id = c.customer_id;
+
+
 -- SECTION 9 — POWER BI VIEWS  (Power BI reads these, never the tables)
 -- Free to store; let us change a table without breaking a report.
 -- =====================================================================
@@ -801,6 +850,10 @@ CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_order_statu
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_ga4_purchases`      AS SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_purchases`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_ref_raffle_economics`     AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.ref_raffle_economics`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_stg_meta_ads_daily`        AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_transaction_touch`   AS SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transaction_touch`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_wh_daily`    AS SELECT * EXCEPT(built_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_wh_daily`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_page_daily`  AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_page_status` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_status`;
 
 
 
@@ -966,6 +1019,271 @@ SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_charit
 
 
 -- =====================================================================
+-- =====================================================================
+-- SECTION 13 — rpt_paid_media_wh_daily  (warehouse side of paid media)
+-- =====================================================================
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_wh_daily`
+PARTITION BY click_date
+CLUSTER BY basis, channel
+OPTIONS (description = "Paid media report, warehouse side. One row per click date x attribution view (F = first touch, L = last touch) x channel x subchannel x campaign x customer type. Purchases paid within 7 days of the click; free entries and subscription renewals excluded. Rebuilt nightly.")
+AS
+WITH a AS (
+  SELECT
+    CAST(transaction_id AS STRING) AS transaction_id,
+    first_touch_url, first_touch_timestamp,
+    last_touch_url,  last_touch_timestamp
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transaction_touch`
+  WHERE purchase_date >= DATE '2026-09-01'
+    AND attribution_basis != 'inherited_from_subscription_signup'
+),
+f AS (
+  SELECT CAST(transaction_id AS STRING) AS transaction_id, purchase_date,
+    revenue_gbp, customer_key, is_first_purchase,
+    (is_subscription_payment OR order_type = 'SUBSCRIPTION') AS is_sub
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_transactions`
+  WHERE purchase_date >= DATE '2026-09-01'
+    AND NOT IFNULL(is_free_entry, FALSE)
+    AND customer_key != 'UNKNOWN_DELETED'
+),
+ch AS (
+  SELECT landing_url, ANY_VALUE(channel_group) AS channel_group, ANY_VALUE(utm_campaign) AS utm_campaign
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_channel_last_touch`
+  GROUP BY 1
+),
+touches AS (
+  SELECT 'F' AS basis, f.*, a.first_touch_url AS url, a.first_touch_timestamp AS touch_ts FROM f JOIN a USING (transaction_id)
+  UNION ALL
+  SELECT 'L' AS basis, f.*, a.last_touch_url  AS url, a.last_touch_timestamp  AS touch_ts FROM f JOIN a USING (transaction_id)
+),
+t AS (
+  SELECT
+    t.basis,
+    DATE(t.touch_ts, 'Europe/London') AS click_date,
+    CASE ch.channel_group
+      WHEN 'Meta' THEN 'Paid Social'
+      WHEN 'Google Ads' THEN 'Google'
+      WHEN 'Microsoft Ads' THEN 'Bing'
+      WHEN 'Affiliate' THEN 'Affiliates'
+      ELSE IFNULL(ch.channel_group, 'Unattributed')
+    END AS channel,
+    CASE
+      WHEN ch.channel_group = 'Meta' THEN
+        CASE WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'rtg') THEN 'RTG'
+             WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'rmg|remarket') THEN 'RMG'
+             WHEN ch.utm_campaign IS NULL THEN 'Unknown'
+             ELSE 'PR' END
+      WHEN ch.channel_group IN ('Google Ads', 'Microsoft Ads') THEN
+        CASE WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'competitor|\|\s*competitor') THEN 'Competitor'
+             WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'generic|\|\s*generic') THEN 'Generic'
+             WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'brand|\|\s*brand') THEN 'Brand'
+             WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'pmax|performance|\|\s*pmax') THEN 'PMAX'
+             WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'demand|dgen|(|_|-)dg(|_|-|$)|\|\s*demand') THEN 'Demand Gen'
+             ELSE 'Unknown' END
+      ELSE NULL
+    END AS subchannel,
+    ch.utm_campaign AS campaign,
+    CONCAT(IF(t.is_first_purchase, 'N', 'E'), IF(t.is_sub, 'S', 'O')) AS ct,
+    t.customer_key, t.revenue_gbp, t.is_first_purchase
+  FROM touches t
+  LEFT JOIN ch ON ch.landing_url = t.url
+  WHERE t.touch_ts IS NOT NULL
+    AND DATE_DIFF(t.purchase_date, DATE(t.touch_ts, 'Europe/London'), DAY) BETWEEN 0 AND 7
+)
+SELECT
+  click_date, basis, channel, subchannel, campaign, ct,
+  COUNT(*) AS purchases,
+  ROUND(SUM(revenue_gbp), 2) AS revenue_gbp,
+  COUNT(DISTINCT IF(is_first_purchase, customer_key, NULL)) AS new_customers,
+  DATE_DIFF(CURRENT_DATE('Europe/London'), click_date, DAY) < 7 AS maturing,
+  CURRENT_TIMESTAMP() AS built_at
+FROM t
+WHERE click_date >= DATE '2026-09-01'
+GROUP BY 1, 2, 3, 4, 5, 6;
+
+
+-- =====================================================================
+-- SECTION 14 — rpt_paid_media_page_daily & rpt_paid_media_page_status
+-- Pre-calculated table for paid media reporting page. One row per day x basis x channel x sub.
+-- =====================================================================
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily`
+PARTITION BY d
+CLUSTER BY basis, channel, sub
+OPTIONS (description = "Pre-calculated table for paid media reporting page. One row per day x basis x channel x sub from 1 Sep 2026. Rebuilt nightly.")
+AS
+WITH spend_raw AS (
+  SELECT
+    spend_date AS d,
+    CASE
+      WHEN ad_platform = 'meta' OR channel_group = 'Paid Social' THEN 'Paid Social'
+      WHEN ad_platform = 'google' THEN 'Google'
+      WHEN ad_platform = 'bing' OR channel_group IN ('Microsoft Ads', 'Bing') THEN 'Bing'
+      WHEN channel_group = 'Affiliates' THEN 'Affiliates'
+      ELSE 'Other'
+    END AS channel,
+    CASE
+      WHEN ad_platform = 'meta' OR channel_group = 'Paid Social' THEN
+        CASE
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'rtg') THEN 'RTG'
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'rmg|remarket') THEN 'RMG'
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'pr|prospecting|(_|^)pr(_|$)') THEN 'PR'
+          ELSE 'Other'
+        END
+      WHEN ad_platform = 'google' OR channel_group IN ('Microsoft Ads', 'Bing') THEN
+        CASE
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'competitor|\|\s*competitor') THEN 'Competitor'
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'generic|\|\s*generic') THEN 'Generic'
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'brand|\|\s*brand') THEN 'Brand'
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'pmax|performance|\|\s*pmax') THEN 'PMax'
+          WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'demand|dgen|(|_|-)dg(|_|-|$)|\|\s*demand') THEN 'Demand Gen'
+          ELSE 'Other'
+        END
+      WHEN channel_group = 'Affiliates' THEN 'All'
+      ELSE 'Other'
+    END AS sub,
+    spend_inc_vat_gbp,
+    impressions,
+    clicks,
+    link_clicks,
+    platform_conversions,
+    platform_conversion_value_gbp
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily`
+  WHERE spend_date >= DATE '2026-09-01'
+),
+spend_agg AS (
+  SELECT
+    d, channel, sub,
+    CAST(ROUND(SUM(spend_inc_vat_gbp), 2) AS NUMERIC) AS spend,
+    CAST(SUM(impressions) AS INT64) AS impr,
+    CAST(SUM(IF(channel = 'Paid Social', link_clicks, clicks)) AS INT64) AS clicks,
+    CAST(SUM(platform_conversions) AS FLOAT64) AS plat_conv,
+    CAST(ROUND(SUM(platform_conversion_value_gbp), 2) AS NUMERIC) AS plat_rev
+  FROM spend_raw
+  WHERE channel IN ('Paid Social', 'Google', 'Bing', 'Affiliates')
+  GROUP BY 1, 2, 3
+),
+spend_both_bases AS (
+  SELECT b.basis, s.*
+  FROM spend_agg s
+  CROSS JOIN (SELECT 'F' AS basis UNION ALL SELECT 'L' AS basis) b
+),
+a AS (
+  SELECT
+    CAST(transaction_id AS STRING) AS transaction_id,
+    first_touch_url, first_touch_timestamp,
+    last_touch_url,  last_touch_timestamp
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transaction_touch`
+  WHERE purchase_date >= DATE '2026-09-01'
+    AND attribution_basis != 'inherited_from_subscription_signup'
+),
+f AS (
+  SELECT CAST(transaction_id AS STRING) AS transaction_id, purchase_date,
+    revenue_gbp, customer_key, is_first_purchase,
+    (is_subscription_payment OR order_type = 'SUBSCRIPTION') AS is_sub
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_transactions`
+  WHERE purchase_date >= DATE '2026-09-01'
+    AND NOT IFNULL(is_free_entry, FALSE)
+    AND customer_key != 'UNKNOWN_DELETED'
+),
+ch AS (
+  SELECT landing_url, ANY_VALUE(channel_group) AS channel_group, ANY_VALUE(utm_campaign) AS utm_campaign
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_channel_last_touch`
+  GROUP BY 1
+),
+touches AS (
+  SELECT 'F' AS basis, f.*, a.first_touch_url AS url, a.first_touch_timestamp AS touch_ts FROM f JOIN a USING (transaction_id)
+  UNION ALL
+  SELECT 'L' AS basis, f.*, a.last_touch_url  AS url, a.last_touch_timestamp  AS touch_ts FROM f JOIN a USING (transaction_id)
+),
+t AS (
+  SELECT
+    t.basis,
+    DATE(t.touch_ts, 'Europe/London') AS click_date,
+    CASE ch.channel_group
+      WHEN 'Meta' THEN 'Paid Social'
+      WHEN 'Google Ads' THEN 'Google'
+      WHEN 'Microsoft Ads' THEN 'Bing'
+      WHEN 'Affiliate' THEN 'Affiliates'
+      ELSE IFNULL(ch.channel_group, 'Unattributed')
+    END AS channel,
+    CASE
+      WHEN ch.channel_group = 'Meta' THEN
+        CASE 
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'rtg') THEN 'RTG'
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'rmg|remarket') THEN 'RMG'
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'pr|prospecting|(_|^)pr(_|$)') THEN 'PR'
+          ELSE 'Other' 
+        END
+      WHEN ch.channel_group IN ('Google Ads', 'Microsoft Ads') THEN
+        CASE 
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'competitor|\|\s*competitor') THEN 'Competitor'
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'generic|\|\s*generic') THEN 'Generic'
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'brand|\|\s*brand') THEN 'Brand'
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'pmax|performance|\|\s*pmax') THEN 'PMax'
+          WHEN REGEXP_CONTAINS(LOWER(ch.utm_campaign), r'demand|dgen|(|_|-)dg(|_|-|$)|\|\s*demand') THEN 'Demand Gen'
+          ELSE 'Other' 
+        END
+      WHEN ch.channel_group = 'Affiliate' THEN 'All'
+      ELSE 'Other'
+    END AS sub,
+    t.customer_key, t.revenue_gbp, t.is_first_purchase, t.is_sub
+  FROM touches t
+  LEFT JOIN ch ON ch.landing_url = t.url
+  WHERE t.touch_ts IS NOT NULL
+    AND DATE_DIFF(t.purchase_date, DATE(t.touch_ts, 'Europe/London'), DAY) BETWEEN 0 AND 7
+    AND DATE(t.touch_ts, 'Europe/London') >= DATE '2026-09-01'
+),
+wh_agg AS (
+  SELECT
+    t.click_date AS d,
+    t.basis,
+    t.channel,
+    t.sub,
+    CAST(COUNT(*) AS INT64) AS wh_orders,
+    CAST(ROUND(SUM(t.revenue_gbp), 2) AS NUMERIC) AS wh_rev,
+    CAST(COUNT(DISTINCT IF(t.is_first_purchase, t.customer_key, NULL)) AS INT64) AS new_cust,
+    CAST(COUNT(DISTINCT IF(t.is_first_purchase AND t.is_sub, t.customer_key, NULL)) AS INT64) AS new_subs,
+    CAST(ROUND(SUM(IF(t.is_first_purchase, h.ltv_3m, 0)), 2) AS NUMERIC) AS ltv3m
+  FROM t
+  LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons` h
+    ON h.customer_key = t.customer_key
+  WHERE t.channel IN ('Paid Social', 'Google', 'Bing', 'Affiliates')
+  GROUP BY 1, 2, 3, 4
+)
+SELECT
+  COALESCE(s.d, w.d) AS d,
+  COALESCE(s.basis, w.basis) AS basis,
+  COALESCE(s.channel, w.channel) AS channel,
+  COALESCE(s.sub, w.sub) AS sub,
+  s.spend,
+  s.impr,
+  s.clicks,
+  s.plat_conv,
+  s.plat_rev,
+  COALESCE(w.wh_orders, 0) AS wh_orders,
+  COALESCE(w.wh_rev, NUMERIC '0') AS wh_rev,
+  COALESCE(w.new_cust, 0) AS new_cust,
+  COALESCE(w.new_subs, 0) AS new_subs,
+  COALESCE(w.ltv3m, NUMERIC '0') AS ltv3m,
+  DATE_DIFF(CURRENT_DATE('Europe/London'), COALESCE(s.d, w.d), DAY) < 7 AS maturing
+FROM spend_both_bases s
+FULL OUTER JOIN wh_agg w
+  ON s.d = w.d
+ AND s.basis = w.basis
+ AND s.channel = w.channel
+ AND s.sub = w.sub;
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_status`
+OPTIONS (description = "One-row status table for paid media reporting page showing latest dates.")
+AS
+SELECT
+  CURRENT_TIMESTAMP() AS built_at,
+  (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_transactions`) AS wh_to,
+  (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'google') AS google_to,
+  (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'meta') AS meta_to,
+  (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'bing' OR channel_group IN ('Microsoft Ads', 'Bing')) AS bing_to,
+  (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE channel_group = 'Affiliates') AS affiliates_to;
+
+
 -- DAILY TESTS
 -- =====================================================================
 
@@ -1075,6 +1393,33 @@ charity_quality AS (
       HAVING COUNT(*) > 1
     )) AS dup_charity_rows,
     DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(date) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily`), DAY) AS charity_days_behind
+),
+paid_media_wh_quality AS (
+  SELECT
+    (SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(click_date AS STRING), '|', basis, '|', channel, '|', IFNULL(subchannel, 'none'), '|', IFNULL(campaign, 'none'), '|', ct))
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_wh_daily`) AS dup_keys,
+    (SELECT COUNTIF(diff_days > 1)
+     FROM (
+       SELECT basis, DATE_DIFF(CURRENT_DATE('Europe/London'), MAX(click_date), DAY) AS diff_days
+       FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_wh_daily`
+       WHERE basis IN ('F', 'L')
+       GROUP BY basis
+     )) AS freshness_f_l_days_behind,
+    (SELECT IF(COUNT(*) > 0, 0, 1)
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_wh_daily`
+     WHERE basis = 'L' AND click_date > DATE '2026-09-19' AND purchases > 0) AS l_purchases_missing_post_sep19
+),
+paid_media_page_quality AS (
+  SELECT
+    (SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(d AS STRING), '|', basis, '|', channel, '|', sub))
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily`) AS dup_page_rows,
+    (SELECT COUNT(*)
+     FROM (
+       SELECT d, ROUND(SUM(IF(basis = 'F', spend, 0)), 2) AS spend_f, ROUND(SUM(IF(basis = 'L', spend, 0)), 2) AS spend_l
+       FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily`
+       GROUP BY d
+       HAVING ROUND(SUM(IF(basis = 'F', spend, 0)) - SUM(IF(basis = 'L', spend, 0)), 2) != 0
+     )) AS spend_parity_diff_days
 ),
 spend_quality AS (
   SELECT
@@ -1247,7 +1592,22 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'charity_sales_no_duplicates', 'HARD'
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'charity_sales_freshness',     'HARD',
                IF(charity_days_behind <= 1, 'PASS', 'FAIL'), 1, charity_days_behind,
                'Max date in rpt_charity_sales_daily reaches yesterday (limit 1 day)' FROM charity_quality
-UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'meta_ad_level_parity', 'WARN', IF(mismatch_days = 0, 'PASS', 'WARN'), 0, mismatch_days, IF(mismatch_days = 0, 'Ad-level spend matches campaign spend within 1% for all days in last 7', CONCAT('Days in last 7 with >1% diff or missing ad-level: ', bad_dates)) FROM meta_ad_parity;
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'meta_ad_level_parity', 'WARN', IF(mismatch_days = 0, 'PASS', 'WARN'), 0, mismatch_days, IF(mismatch_days = 0, 'Ad-level spend matches campaign spend within 1% for all days in last 7', CONCAT('Days in last 7 with >1% diff or missing ad-level: ', bad_dates)) FROM meta_ad_parity
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_wh_no_duplicates', 'HARD',
+               IF(dup_keys = 0, 'PASS', 'FAIL'), 0, dup_keys,
+               'Zero duplicate keys in rpt_paid_media_wh_daily' FROM paid_media_wh_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_wh_freshness',     'HARD',
+               IF(freshness_f_l_days_behind = 0, 'PASS', 'FAIL'), 0, freshness_f_l_days_behind,
+               'Max click_date in rpt_paid_media_wh_daily reaches yesterday for both F and L (limit 1 day)' FROM paid_media_wh_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_wh_recent_purchases', 'HARD',
+               IF(l_purchases_missing_post_sep19 = 0, 'PASS', 'FAIL'), 0, l_purchases_missing_post_sep19,
+               'Last touch (L) has purchases after 19 Sep' FROM paid_media_wh_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_page_no_duplicates', 'HARD',
+               IF(dup_page_rows = 0, 'PASS', 'FAIL'), 0, dup_page_rows,
+               'Zero duplicate (d, basis, channel, sub) rows in rpt_paid_media_page_daily' FROM paid_media_page_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_page_spend_parity', 'HARD',
+               IF(spend_parity_diff_days = 0, 'PASS', 'FAIL'), 0, spend_parity_diff_days,
+               'Spend on F = spend on L per day across all dates' FROM paid_media_page_quality;
 
 -- Order-status parity is its own statement: BigQuery allows only ONE
 -- snapshot time per source table per statement, and this table was built
@@ -1286,7 +1646,10 @@ BEGIN
     ('fact_marketing_spend_daily', 'spend_ex_vat_gbp', 'Daily paid media spend excluding VAT in pounds. Matches platform-reported spend.', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('fact_marketing_spend_daily', 'spend_inc_vat_gbp', 'Daily paid media spend including 20% VAT in pounds. ROUND(spend_ex_vat_gbp * 1.2, 2). Used for ROAS and ROI.', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('fact_marketing_spend_daily', 'vat_rate', 'VAT rate applied to ad spend (0.20 for 20% UK VAT).', 'none', 'approved', CURRENT_TIMESTAMP()),
-    ('fact_marketing_spend_daily', 'meta_funnel', 'Meta campaign funnel stage classified from campaign name (Prospecting, Retargeting, Remarketing, or Unknown (daily total) for manual upload). NULL for Google.', 'none', 'approved', CURRENT_TIMESTAMP())
+    ('fact_marketing_spend_daily', 'meta_funnel', 'Meta campaign funnel stage classified from campaign name (Prospecting, Retargeting, Remarketing, or Unknown (daily total) for manual upload). NULL for Google.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('dim_subscription_model', 'tier_band', 'internal curve grouping; use tier_name in reports', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('dim_subscription_model', 'tier_name', 'Website subscription tier: Bronze (£10/£15), Silver (£20/£25/£30), Gold (£35/£50), Platinum (£55/£75), Other.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('customer_ltv_horizons', 'current_tier_name', 'The website tier name of the customer active subscription (Bronze, Silver, Gold, Platinum, Other), NULL if none.', 'none', 'approved', CURRENT_TIMESTAMP())
   ])) S
   ON T.table_name = S.table_name AND T.column_name = S.column_name
   WHEN MATCHED THEN UPDATE SET description = S.description, pii_level = S.pii_level, status = S.status, updated_at = S.updated_at

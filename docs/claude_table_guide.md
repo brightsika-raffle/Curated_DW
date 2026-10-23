@@ -18,12 +18,16 @@ This document is the authoritative table guide to paste into Claude's instructio
 
 | Purpose | Approved Table / View | Grain | Date Partition / Filter Column | Example Query Cost |
 |---|---|---|---|---|
+| **Paid Media Reporting (Default)** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily` (or `vw_rpt_paid_media_page_daily`) | 1 row per `d` × `basis` ('F'/'L') × `channel` × `sub` | `d` (PARTITION) | ~0.14 MB |
+| **Paid Media Pipeline Status** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_status` | 1 row status summary with max dates | `built_at` | ~0.001 MB |
+| **Paid Media Warehouse Attribution** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_wh_daily` | 1 row per `click_date` × `basis` × `channel` × `subchannel` × `campaign` × `ct` | `click_date` (PARTITION) | ~0.10 MB |
 | **Revenue & Orders** | `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions` (or `vw_fact_transactions`) | 1 row per ACCEPTED order | `purchase_date` (PARTITION) | ~0.74 MB |
 | **Channel Performance (Blended & ROAS)** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_channel_perf_daily` | 1 row per `touch_date` × `channel` × `subchannel` | `touch_date` | ~0.02 MB |
 | **Marketing Paid Spend** | `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` (or `vw_fact_marketing_spend_daily`) | 1 row per `spend_date` × `ad_platform` × `channel_group` × `campaign_id` | `spend_date` (PARTITION) | ~0.03 MB |
 | **Customer Acquisition & Cohorts** | `rh-ga4-491819.rh_curated_Bright_Test.dim_customer` (or `vw_dim_customer`) | 1 row per customer (hashed email, no PII) | `acq_first_purchase_date` | ~19.76 MB |
 | **Subscriptions** | `rh-ga4-491819.rh_curated_Bright_Test.fact_subscriptions` (or `vw_fact_subscriptions`) | 1 row per real subscription (baskets excluded) | `created_date` (PARTITION MONTH) | ~0.60 MB |
-| **Customer LTV & Churn** | `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons` | 1 row per customer | `as_of_date` | ~13.38 MB |
+| **Subscription Tiers** | `rh-ga4-491819.rh_curated_Bright_Test.dim_subscription_model` (or `vw_dim_subscription_model`) | 1 row per model/tier (`tier_name`: Bronze, Silver, Gold, Platinum, Other) | None (~10 rows) | ~0.001 MB |
+| **Customer LTV & Churn** | `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons` | 1 row per customer with `current_tier_name` | `as_of_date` | ~13.38 MB |
 | **Charity Performance** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily` | 1 row per `date` × `selected_charity` | `date` | ~0.05 MB |
 | **Business Health & Order Status** | `rh-ga4-491819.rh_curated_Bright_Test.fact_order_status_daily` (or `vw_fact_order_status_daily`) | 1 row per `order_date` × `payment_status` | `order_date` (PARTITION) | ~0.01 MB |
 
@@ -116,8 +120,16 @@ ORDER BY 1 DESC, 3 DESC;
 
 ### 2.5. Subscriptions (Active, Churned, Tiers)
 - **Table:** `rh-ga4-491819.rh_curated_Bright_Test.fact_subscriptions`
+- **Model Table:** `rh-ga4-491819.rh_curated_Bright_Test.dim_subscription_model`
 - **Grain:** One row per subscription contract (baskets excluded).
 - **Date Column:** `created_date` (Partitioned by month).
+- **MANDATORY TIER NAMING RULE:** **Always say Bronze/Silver/Gold/Platinum, never Low/Mid/High.**
+  - `Bronze`: £15 (and older £10)
+  - `Silver`: £30 (and older £20 / £25)
+  - `Gold`: £50 (and older £35)
+  - `Platinum`: £75 (and older £55)
+  - `Other`: any other price
+  - Note: `tier_band` (Low/Mid/High/Very High) is retained solely as an internal survival curve grouping (Platinum folded into High for the curve). In all business summaries, reports, and Claude prompts, use `tier_name`!
 - **Example Cheap Query (Dry Run: ~625 KB / 0.60 MB):**
 ```sql
 SELECT
@@ -136,18 +148,20 @@ ORDER BY 1 DESC;
 ### 2.6. Customer LTV Horizons
 - **Table:** `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons`
 - **Grain:** One row per customer with realized and projected forward LTV (3m, 6m, 12m, 36m).
+- **Subscription Tier Column:** `current_tier_name` (the website tier name of the customer's active subscription: Bronze, Silver, Gold, Platinum; NULL if none).
 - **Rule:** Always report **mean and median** together, as high-value outliers skew the mean by >200%.
 - **Example Cheap Query (Dry Run: ~13.38 MB):**
 ```sql
 SELECT
   ltv_segment,
+  current_tier_name,
   COUNT(*) AS customer_count,
   ROUND(AVG(realised_value), 2) AS mean_realised_value,
   APPROX_QUANTILES(realised_value, 100)[OFFSET(50)] AS median_realised_value,
   ROUND(AVG(ltv_12m), 2) AS mean_12m_ltv,
   APPROX_QUANTILES(ltv_12m, 100)[OFFSET(50)] AS median_12m_ltv
 FROM `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons`
-GROUP BY 1
+GROUP BY 1, 2
 ORDER BY customer_count DESC;
 ```
 
@@ -188,6 +202,34 @@ FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_order_status_daily`
 WHERE order_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 30 DAY)
 GROUP BY 1, 2
 ORDER BY 1 DESC, 3 DESC;
+```
+
+---
+
+### 2.9. Paid Media Reporting (DEFAULT Source for Paid Media Questions)
+- **Table:** `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily`
+- **Status Table:** `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_status`
+- **Grain:** One row per day (`d`) × attribution basis (`basis`: 'F' for first touch, 'L' for last touch) × channel (`Paid Social`, `Google`, `Bing`, `Affiliates`) × subchannel (`sub`: PR, RMG, RTG, Brand, Generic, Competitor, PMax, Demand Gen, All, Other).
+- **Date Column:** `d` (Partition key).
+- **Why Use This:** Pre-calculated nightly table combining inc-VAT spend, platform impressions/clicks/conversions, warehouse orders/revenue within 7 days, new acquired customers, new subscription customers, and 3-month LTV (`ltv3m`). Running reports against this table scans under 1 MB and costs virtually nothing.
+- **Example Cheap Query (Dry Run: ~140 KB / 0.14 MB):**
+```sql
+SELECT
+  d,
+  channel,
+  sub,
+  spend,
+  clicks,
+  wh_orders,
+  wh_rev,
+  ROUND(SAFE_DIVIDE(wh_rev, spend), 2) AS roas,
+  new_cust,
+  new_subs,
+  ltv3m
+FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily`
+WHERE basis = 'L'
+  AND d >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 30 DAY)
+ORDER BY d DESC, wh_rev DESC;
 ```
 
 ---
