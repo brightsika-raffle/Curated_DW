@@ -804,6 +804,167 @@ CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_stg_meta_ads_dai
 
 
 
+
+-- =====================================================================
+-- SECTION 10 — rpt_charity_sales_daily  (daily sales by charity)
+-- One row per date x selected_charity x charity_type.
+-- Reads ONLY fact_transactions (source). Full rebuild nightly.
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily`
+PARTITION BY date
+CLUSTER BY charity_type, selected_charity
+OPTIONS (description = "Daily sales by charity and category from fact_transactions. Full rebuild nightly.")
+AS
+WITH valid_tx AS (
+  SELECT
+    DATE(COALESCE(purchase_date, created_at), 'Europe/London') AS date,
+    customer_id,
+    transaction_id,
+    CAST(total_cost AS NUMERIC) / 100 AS total_cost_gbp,
+    COALESCE(NULLIF(TRIM(selected_charity), ''), 'No charity selected') AS raw_charity,
+    ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY COALESCE(purchase_date, created_at) ASC, transaction_id ASC) AS cust_tx_rank
+  FROM `rh-ga4-491819.rh_warehouse.fact_transactions`
+  WHERE 
+    payment_status != 'PENDING_BASKET'
+    AND COALESCE(payment_initiated_by, '') != 'recurring'
+    AND NOT (COALESCE(order_type, '') = 'wowcher' AND total_cost = 0)
+    AND (total_cost > 0 OR (total_cost = 0 AND subscription_id IS NOT NULL))
+),
+norm_charity AS (
+  SELECT
+    date,
+    customer_id,
+    transaction_id,
+    total_cost_gbp,
+    cust_tx_rank,
+    CASE 
+      WHEN LOWER(raw_charity) LIKE '%brain tumour%' THEN 'Brain Tumour Research'
+      WHEN LOWER(raw_charity) LIKE '%war paws%' THEN 'War Paws'
+      WHEN LOWER(raw_charity) LIKE '%centrepoint%' OR LOWER(raw_charity) LIKE '%centre point%' THEN 'CentrePoint'
+      WHEN LOWER(raw_charity) LIKE '%all dogs matter%' THEN 'All Dogs Matter'
+      WHEN LOWER(raw_charity) LIKE '%dragonfly cancer%' THEN 'Dragonfly Cancer Trust'
+      WHEN LOWER(raw_charity) LIKE '%housingforwomen%' OR LOWER(raw_charity) LIKE '%housing for women%' THEN 'HousingForWomen'
+      WHEN LOWER(raw_charity) LIKE '%when you wish upon a star%' THEN 'When You Wish Upon a Star'
+      WHEN LOWER(raw_charity) LIKE '%dogs for autism%' THEN 'Dogs for Autism'
+      WHEN LOWER(raw_charity) LIKE '%cat watch%' THEN 'Cat Watch Rescue Shelter'
+      WHEN LOWER(raw_charity) LIKE '%sense%' THEN 'Sense'
+      WHEN LOWER(raw_charity) LIKE '%mental health innovations%' OR LOWER(raw_charity) LIKE '%shout%' THEN 'Mental Health Innovations (formerly Shout)'
+      WHEN LOWER(raw_charity) LIKE '%british heart%' THEN 'British Heart Foundation'
+      WHEN LOWER(raw_charity) LIKE '%phoenix rehoming%' THEN 'Phoenix Rehoming'
+      WHEN LOWER(raw_charity) LIKE '%helpful hounds%' THEN 'Helpful Hounds'
+      WHEN LOWER(raw_charity) LIKE '%cfenc%' THEN "CFENC (children's education)"
+      WHEN LOWER(raw_charity) LIKE '%it gets better%' THEN 'It Gets Better'
+      WHEN LOWER(raw_charity) LIKE '%head up%' THEN 'Head Up'
+      WHEN LOWER(raw_charity) LIKE '%momentum%' THEN 'Momentum'
+      WHEN LOWER(raw_charity) LIKE '%beyond conflict%' THEN 'Beyond Conflict'
+      WHEN LOWER(raw_charity) LIKE '%save the children%' THEN 'Save the Children'
+      WHEN LOWER(raw_charity) LIKE '%prostate cancer%' THEN 'Prostate Cancer UK'
+      WHEN LOWER(raw_charity) LIKE '%miracle%mission%' THEN "Miracle's Mission"
+      WHEN LOWER(raw_charity) LIKE '%alzheimer%research%' THEN "Alzheimer's Research UK"
+      WHEN LOWER(raw_charity) LIKE '%marie curie%' THEN 'Marie Curie'
+      WHEN LOWER(raw_charity) LIKE '%children in need%' THEN 'Children in Need'
+      WHEN LOWER(raw_charity) LIKE '%penny%ark%' THEN "Penny's Ark"
+      WHEN LOWER(raw_charity) LIKE '%pipal tree%' THEN 'Pipal Tree'
+      WHEN LOWER(raw_charity) LIKE '%nspcc%' THEN 'NSPCC'
+      WHEN LOWER(raw_charity) LIKE '%emmaus%' THEN 'Emmaus'
+      WHEN LOWER(raw_charity) LIKE '%wwf%' THEN 'WWF'
+      WHEN LOWER(raw_charity) LIKE '%dementia uk%' THEN 'Dementia UK'
+      WHEN LOWER(raw_charity) LIKE '%alzheimer%society%' THEN "Alzheimer's Society"
+      WHEN LOWER(raw_charity) LIKE '%rain rescue%' THEN 'Rain Rescue'
+      WHEN LOWER(raw_charity) LIKE '%cancer research uk%' THEN 'Cancer Research UK'
+      WHEN LOWER(raw_charity) LIKE '%parkinson%' THEN "Parkinson's UK"
+      WHEN LOWER(raw_charity) LIKE '%samaritans%' THEN 'Samaritans'
+      WHEN LOWER(raw_charity) LIKE '%british red cross%' THEN 'British Red Cross'
+      WHEN LOWER(raw_charity) LIKE '%leukaemia uk%' THEN 'Leukaemia UK'
+      WHEN LOWER(raw_charity) LIKE '%millimetres 2 mountains%' THEN 'Millimetres 2 Mountains'
+      WHEN LOWER(raw_charity) LIKE '%support dogs%' THEN 'Support Dogs'
+      WHEN LOWER(raw_charity) LIKE '%battersea%' THEN 'Battersea Dogs and Cats Home'
+      WHEN LOWER(raw_charity) LIKE '%st. john ambulance%' OR LOWER(raw_charity) LIKE '%st john ambulance%' THEN 'St. John Ambulance'
+      WHEN LOWER(raw_charity) LIKE '%national trust%' THEN 'National Trust'
+      WHEN LOWER(raw_charity) LIKE '%barnardo%' THEN "Barnardo's"
+      WHEN LOWER(raw_charity) LIKE '%felix fund%' THEN 'Felix Fund'
+      WHEN LOWER(raw_charity) LIKE '%macmillan%' THEN 'Macmillan Cancer Support'
+      WHEN LOWER(raw_charity) LIKE '%ips%' THEN 'IPS'
+      WHEN LOWER(raw_charity) LIKE '%royal british legion%' THEN 'Royal British Legion'
+      WHEN LOWER(raw_charity) LIKE '%challenging mnd%' THEN 'Challenging MND'
+      WHEN LOWER(raw_charity) LIKE '%nomad opening doors%' THEN 'Nomad Opening Doors'
+      WHEN LOWER(raw_charity) LIKE '%keep britain tidy%' THEN 'Keep Britain Tidy'
+      WHEN LOWER(raw_charity) LIKE '%diabetes uk%' THEN 'Diabetes UK'
+      WHEN LOWER(raw_charity) LIKE '%moodswings%' THEN 'Moodswings'
+      WHEN LOWER(raw_charity) LIKE '%duke of edinburgh%' THEN 'Duke of Edinburgh Awards'
+      WHEN LOWER(raw_charity) LIKE '%guide dogs%' THEN 'Guide Dogs'
+      WHEN LOWER(raw_charity) LIKE '%rspca%' THEN 'RSPCA'
+      WHEN LOWER(raw_charity) LIKE '%rnli%' THEN 'RNLI Lifeboats'
+      WHEN LOWER(raw_charity) LIKE '%war child%' THEN 'War Child'
+      WHEN LOWER(raw_charity) LIKE '%science and technology%' THEN 'The Foundation for Science and Technology'
+      WHEN LOWER(raw_charity) LIKE '%help for heroes%' THEN 'Help for Heroes'
+      WHEN LOWER(raw_charity) LIKE '%scar free%' THEN 'The Scar Free Foundation'
+      WHEN LOWER(raw_charity) LIKE '%great ormond%' OR LOWER(raw_charity) LIKE '%greatormond%' THEN 'Great Ormond Street Hospital'
+      WHEN LOWER(raw_charity) LIKE '%flying seagull%' THEN 'The Flying Seagull Project'
+      WHEN LOWER(raw_charity) LIKE '%serve on%' THEN 'Serve On'
+      WHEN raw_charity IN ('none', 'No charity selected') THEN 'No charity selected'
+      ELSE raw_charity
+    END AS selected_charity
+  FROM valid_tx
+),
+categorized AS (
+  SELECT
+    date,
+    customer_id,
+    transaction_id,
+    total_cost_gbp,
+    cust_tx_rank,
+    selected_charity,
+    CASE 
+      WHEN selected_charity IN (
+        'Brain Tumour Research', 'Dragonfly Cancer Trust', 'British Heart Foundation',
+        'Prostate Cancer UK', "Alzheimer's Research UK", 'Marie Curie', 'Dementia UK',
+        "Alzheimer's Society", 'Cancer Research UK', "Parkinson's UK", 'Leukaemia UK',
+        'Macmillan Cancer Support', 'Challenging MND', 'Diabetes UK',
+        'Mental Health Innovations (formerly Shout)', 'Head Up', 'St. John Ambulance',
+        'The Scar Free Foundation', 'Moodswings'
+      ) THEN 'health'
+      WHEN selected_charity IN (
+        'War Paws', 'All Dogs Matter', 'Dogs for Autism', 'Cat Watch Rescue Shelter',
+        'Phoenix Rehoming', 'Helpful Hounds', "Miracle's Mission", "Penny's Ark",
+        'Rain Rescue', 'Support Dogs', 'Battersea Dogs and Cats Home', 'Guide Dogs', 'RSPCA'
+      ) THEN 'animals'
+      WHEN selected_charity IN (
+        'When You Wish Upon a Star', "CFENC (children's education)", 'Momentum',
+        'Save the Children', 'Children in Need', 'NSPCC', "Barnardo's",
+        'Duke of Edinburgh Awards', 'War Child', 'Great Ormond Street Hospital',
+        'The Flying Seagull Project'
+      ) THEN 'children'
+      WHEN selected_charity IN (
+        'CentrePoint', 'HousingForWomen', 'Sense', 'It Gets Better', 'Beyond Conflict',
+        'Pipal Tree', 'Emmaus', 'Samaritans', 'British Red Cross', 'Millimetres 2 Mountains',
+        'Felix Fund', 'IPS', 'Royal British Legion', 'Nomad Opening Doors',
+        'RNLI Lifeboats', 'Help for Heroes', 'Serve On'
+      ) THEN 'community'
+      WHEN selected_charity IN (
+        'WWF', 'National Trust', 'Keep Britain Tidy'
+      ) THEN 'environment'
+      ELSE 'other'
+    END AS charity_type
+  FROM norm_charity
+)
+SELECT
+  date,
+  selected_charity,
+  charity_type,
+  COUNT(transaction_id) AS purchases,
+  ROUND(SUM(total_cost_gbp), 2) AS revenue,
+  COUNTIF(cust_tx_rank = 1) AS new_customers,
+  ROUND(SAFE_DIVIDE(SUM(total_cost_gbp), COUNT(transaction_id)), 2) AS average_basket,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM categorized
+GROUP BY 1, 2, 3;
+
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_charity_sales_daily` AS
+SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily`;
+
+
 -- =====================================================================
 -- DAILY TESTS
 -- =====================================================================
@@ -903,6 +1064,17 @@ mspend_overlap AS (
     GROUP BY 1
   ) api ON man.spend_date = api.spend_date
   WHERE ABS(COALESCE(man.spend, 0) - COALESCE(api.spend, 0)) > 1.0
+),
+
+charity_quality AS (
+  SELECT
+    (SELECT COUNT(*) FROM (
+      SELECT date, selected_charity 
+      FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily` 
+      GROUP BY 1, 2 
+      HAVING COUNT(*) > 1
+    )) AS dup_charity_rows,
+    DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(date) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily`), DAY) AS charity_days_behind
 ),
 spend_quality AS (
   SELECT
@@ -1069,6 +1241,12 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'meta_api_parity',        'HARD', IF(
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'meta_no_double_source',   'HARD', IF(overlap_dates = 0, 'PASS', 'FAIL'), 0, overlap_dates, 'No Meta date has rows from both manual and API sources' FROM meta_double_source
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'ga4_purchase_parity',   'WARN', IF(diff_pct <= 10.0, 'PASS', 'WARN'), web_checkouts, ga4_rows, 'GA4 BoughtTickets rows within ±10% of web checkouts for previous month' FROM ga4_parity
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tagging_exceptions',    'WARN', IF(purchasing_visitors = 0, 'PASS', 'WARN'), 0, purchasing_visitors, CONCAT('Top mis-tagged campaigns: ', top_5_campaigns) FROM tagging_exc
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'charity_sales_no_duplicates', 'HARD',
+               IF(dup_charity_rows = 0, 'PASS', 'FAIL'), 0, dup_charity_rows,
+               'Zero duplicate (date, charity) rows in rpt_charity_sales_daily' FROM charity_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'charity_sales_freshness',     'HARD',
+               IF(charity_days_behind <= 1, 'PASS', 'FAIL'), 1, charity_days_behind,
+               'Max date in rpt_charity_sales_daily reaches yesterday (limit 1 day)' FROM charity_quality
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'meta_ad_level_parity', 'WARN', IF(mismatch_days = 0, 'PASS', 'WARN'), 0, mismatch_days, IF(mismatch_days = 0, 'Ad-level spend matches campaign spend within 1% for all days in last 7', CONCAT('Days in last 7 with >1% diff or missing ad-level: ', bad_dates)) FROM meta_ad_parity;
 
 -- Order-status parity is its own statement: BigQuery allows only ONE
