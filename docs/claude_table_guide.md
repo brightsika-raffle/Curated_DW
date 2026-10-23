@@ -29,6 +29,9 @@ This document is the authoritative table guide to paste into Claude's instructio
 | **Subscription Tiers** | `rh-ga4-491819.rh_curated_Bright_Test.dim_subscription_model` (or `vw_dim_subscription_model`) | 1 row per model/tier (`tier_name`: Bronze, Silver, Gold, Platinum, Other) | None (~10 rows) | ~0.001 MB |
 | **Customer LTV & Churn** | `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons` | 1 row per customer with `current_tier_name` | `as_of_date` | ~13.38 MB |
 | **Charity Performance** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily` | 1 row per `date` × `selected_charity` | `date` | ~0.05 MB |
+| **Organic Social Weekly Report** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_weekly` | 1 row per `week_commencing` × `platform` | `week_commencing` (PARTITION) | ~0.01 MB |
+| **Organic Social Daily Traffic & Sales** | `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily` | 1 row per `date` × `platform` × `traffic_category` | `date` | ~0.18 MB |
+| **Organic Social Pipeline Status** | `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_status` | 1 row status summary with Meta connection state | `built_at` | ~0.001 MB |
 | **Business Health & Order Status** | `rh-ga4-491819.rh_curated_Bright_Test.fact_order_status_daily` (or `vw_fact_order_status_daily`) | 1 row per `order_date` × `payment_status` | `order_date` (PARTITION) | ~0.01 MB |
 
 ---
