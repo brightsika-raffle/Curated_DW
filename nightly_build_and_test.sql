@@ -1277,11 +1277,73 @@ OPTIONS (description = "One-row status table for paid media reporting page showi
 AS
 SELECT
   CURRENT_TIMESTAMP() AS built_at,
+  DATE '2026-10-19' AS tracking_changed_on,
   (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_transactions`) AS wh_to,
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'google') AS google_to,
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'meta') AS meta_to,
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'bing' OR channel_group IN ('Microsoft Ads', 'Bing')) AS bing_to,
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE channel_group = 'Affiliates') AS affiliates_to;
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_status`
+OPTIONS (description = "One-row status table for organic social reporting page showing sync and break dates.")
+AS
+SELECT
+  CURRENT_TIMESTAMP() AS built_at,
+  DATE '2026-10-19' AS tracking_changed_on,
+  FALSE AS meta_connected,
+  CAST(NULL AS DATE) AS ig_data_to,
+  CAST(NULL AS DATE) AS fb_data_to,
+  (SELECT MAX(date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`) AS site_data_to;
+
+-- =====================================================================
+-- SECTION 14 — rpt_tracking_coverage_daily  (rebuilt nightly from 2026-09-01)
+-- =====================================================================
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
+CLUSTER BY d
+OPTIONS (description = 'Daily tracking coverage tracking orders with last-touch URL vs unassigned GA4 sessions and consent. Rebuilt nightly from 2026-09-01.')
+AS
+WITH dates AS (
+  SELECT d
+  FROM UNNEST(GENERATE_DATE_ARRAY(DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))) AS d
+),
+orders_daily AS (
+  SELECT
+    t.purchase_date AS d,
+    COUNT(*) AS orders,
+    COUNTIF(touch.last_touch_url IS NOT NULL AND TRIM(touch.last_touch_url) != '') AS orders_tracked
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions` t
+  LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.fact_transaction_touch` touch
+    ON t.transaction_id = touch.transaction_id
+  WHERE t.purchase_date >= DATE '2026-09-01'
+    AND NOT IFNULL(t.is_free_entry, FALSE)
+    AND touch.attribution_basis != 'inherited_from_subscription_signup'
+  GROUP BY 1
+),
+ga4_daily AS (
+  SELECT
+    date AS d,
+    SUM(sessions) AS ga4_sessions,
+    SUM(IF(ga4_channel_group = 'Unassigned', sessions, 0)) AS ga4_unassigned
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.ga4_source_daily`
+  WHERE date >= DATE '2026-09-01'
+  GROUP BY 1
+)
+SELECT
+  d.d,
+  COALESCE(o.orders, 0) AS orders,
+  COALESCE(o.orders_tracked, 0) AS orders_tracked,
+  ROUND(SAFE_DIVIDE(COALESCE(o.orders_tracked, 0), o.orders), 4) AS pct_tracked,
+  COALESCE(g.ga4_sessions, 0) AS ga4_sessions,
+  COALESCE(g.ga4_unassigned, 0) AS ga4_unassigned,
+  ROUND(SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), g.ga4_sessions), 4) AS pct_unassigned,
+  CAST(NULL AS FLOAT64) AS consent_granted_share,
+  CURRENT_TIMESTAMP() AS built_at
+FROM dates d
+LEFT JOIN orders_daily o ON d.d = o.d
+LEFT JOIN ga4_daily g ON d.d = g.d;
+
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_tracking_coverage_daily` AS
+SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`;
 
 
 -- DAILY TESTS
@@ -1542,6 +1604,12 @@ null_pseudo AS (
   SELECT COUNTIF(user_pseudo_id IS NULL) AS n
   FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_purchases`
 ),
+tracking_coverage_quality AS (
+  SELECT
+    (SELECT COUNT(*) - COUNT(DISTINCT d) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`) AS dup_d,
+    (SELECT pct_tracked FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
+     WHERE d = DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)) AS yesterday_pct_tracked
+),
 tagging_exc AS (
   SELECT
     COALESCE(SUM(purchasing_visitors), 0) AS purchasing_visitors,
@@ -1607,7 +1675,13 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_page_no_duplicates', 'HAR
                'Zero duplicate (d, basis, channel, sub) rows in rpt_paid_media_page_daily' FROM paid_media_page_quality
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_page_spend_parity', 'HARD',
                IF(spend_parity_diff_days = 0, 'PASS', 'FAIL'), 0, spend_parity_diff_days,
-               'Spend on F = spend on L per day across all dates' FROM paid_media_page_quality;
+               'Spend on F = spend on L per day across all dates' FROM paid_media_page_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_coverage_no_duplicates', 'HARD',
+               IF(dup_d = 0, 'PASS', 'FAIL'), 0, dup_d,
+               'Zero duplicate d in rpt_tracking_coverage_daily' FROM tracking_coverage_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_coverage_pct_tracked', 'WARN',
+               IF(yesterday_pct_tracked >= 0.90, 'PASS', 'WARN'), 0.90, ROUND(CAST(yesterday_pct_tracked AS NUMERIC), 4),
+               'pct_tracked for yesterday >= 0.90 (warns if cookie change reduced tracking)' FROM tracking_coverage_quality;
 
 -- Order-status parity is its own statement: BigQuery allows only ONE
 -- snapshot time per source table per statement, and this table was built
