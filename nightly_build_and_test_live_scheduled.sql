@@ -2138,6 +2138,202 @@ LEFT JOIN platform_daily p ON g.d = p.d AND g.entity_id = p.entity_id
 LEFT JOIN wh_daily w ON g.d = w.d AND g.basis = w.basis AND g.entity_id = w.entity_id;
 
 
+-- =====================================================================
+-- SECTION 17 — rpt_trial_conversion & vw_trial_status
+-- =====================================================================
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`
+CLUSTER BY cohort, tier
+OPTIONS (description = "Free-trial to paid conversion by trial start month (cohort) and plan tier, plus trailing 90-day conversion rate by tier (with fallback to overall rate when a tier has < 30 trials). Rebuilt nightly.")
+AS
+WITH paid_sub_tx AS (
+  SELECT
+    subscription_key,
+    MIN(purchase_date) AS first_paid_date
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`
+  WHERE subscription_key IS NOT NULL
+    AND revenue_gbp > 0
+    AND NOT IFNULL(is_free_entry, FALSE)
+  GROUP BY subscription_key
+),
+trials AS (
+  SELECT
+    s.subscription_key,
+    s.customer_key,
+    s.created_date AS start_date,
+    DATE_TRUNC(s.created_date, MONTH) AS cohort,
+    s.status,
+    s.monthly_value_gbp,
+    COALESCE(
+      m.tier_name,
+      CASE
+        WHEN s.monthly_value_gbp IN (10, 15) THEN 'Bronze'
+        WHEN s.monthly_value_gbp IN (20, 25, 30) THEN 'Silver'
+        WHEN s.monthly_value_gbp IN (35, 50) THEN 'Gold'
+        WHEN s.monthly_value_gbp IN (55, 75) THEN 'Platinum'
+        ELSE 'Other'
+      END
+    ) AS tier,
+    COALESCE(
+      m.tier_band,
+      CASE
+        WHEN s.monthly_value_gbp < 20 THEN 'Low'
+        WHEN s.monthly_value_gbp < 40 THEN 'Mid'
+        WHEN s.monthly_value_gbp < 60 THEN 'High'
+        ELSE 'Very High'
+      END
+    ) AS tier_band,
+    p.first_paid_date,
+    p.subscription_key IS NOT NULL AS is_converted,
+    IF(
+      p.subscription_key IS NOT NULL,
+      GREATEST(DATE_DIFF(p.first_paid_date, s.created_date, DAY), 0),
+      NULL
+    ) AS days_to_convert
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_subscriptions` s
+  LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.dim_subscription_model` m
+    ON s.subscription_model_key = m.subscription_model_key
+  LEFT JOIN paid_sub_tx p
+    ON s.subscription_key = p.subscription_key
+  WHERE s.is_special_offer_trial
+),
+cohort_tier_med AS (
+  SELECT DISTINCT
+    cohort,
+    tier,
+    PERCENTILE_CONT(CAST(days_to_convert AS FLOAT64), 0.5) OVER (PARTITION BY cohort, tier) AS median_days_raw
+  FROM trials
+),
+cohort_tier_agg AS (
+  SELECT
+    t.cohort,
+    t.tier,
+    ANY_VALUE(t.tier_band) AS tier_band,
+    COUNT(*) AS trials,
+    COUNTIF(t.is_converted) AS converted,
+    COUNTIF(NOT t.is_converted AND t.status = 'ACTIVE') AS active_trials,
+    COUNTIF(NOT t.is_converted AND t.status != 'ACTIVE') AS lapsed_trials,
+    ROUND(CAST(SAFE_DIVIDE(COUNTIF(t.is_converted), COUNT(*)) AS NUMERIC), 4) AS conversion_rate,
+    ROUND(CAST(AVG(t.days_to_convert) AS NUMERIC), 2) AS mean_days
+  FROM trials t
+  GROUP BY t.cohort, t.tier
+),
+trailing_90d_tier AS (
+  SELECT
+    tier,
+    COUNT(*) AS trailing_90d_trials,
+    COUNTIF(is_converted) AS trailing_90d_converted,
+    SAFE_DIVIDE(COUNTIF(is_converted), COUNT(*)) AS trailing_90d_tier_cvr
+  FROM trials
+  WHERE start_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 90 DAY)
+  GROUP BY tier
+),
+trailing_90d_overall AS (
+  SELECT
+    COUNT(*) AS overall_90d_trials,
+    COUNTIF(is_converted) AS overall_90d_converted,
+    SAFE_DIVIDE(COUNTIF(is_converted), COUNT(*)) AS overall_90d_cvr
+  FROM trials
+  WHERE start_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 90 DAY)
+)
+SELECT
+  a.cohort,
+  a.tier,
+  a.tier_band,
+  a.trials,
+  a.converted,
+  a.active_trials,
+  a.lapsed_trials,
+  a.conversion_rate,
+  ROUND(CAST(m.median_days_raw AS NUMERIC), 2) AS median_days,
+  a.mean_days,
+  COALESCE(t90.trailing_90d_trials, 0) AS trailing_90d_trials,
+  COALESCE(t90.trailing_90d_converted, 0) AS trailing_90d_converted,
+  ROUND(CAST(t90.trailing_90d_tier_cvr AS NUMERIC), 4) AS trailing_90d_tier_cvr,
+  ROUND(CAST(o90.overall_90d_cvr AS NUMERIC), 4) AS trailing_90d_overall_cvr,
+  ROUND(
+    CAST(
+      IF(COALESCE(t90.trailing_90d_trials, 0) >= 30, t90.trailing_90d_tier_cvr, o90.overall_90d_cvr)
+      AS NUMERIC
+    ),
+    4
+  ) AS trailing_90d_conversion_rate,
+  CURRENT_TIMESTAMP() AS built_at
+FROM cohort_tier_agg a
+LEFT JOIN cohort_tier_med m
+  ON a.cohort = m.cohort AND a.tier = m.tier
+LEFT JOIN trailing_90d_tier t90
+  ON a.tier = t90.tier
+CROSS JOIN trailing_90d_overall o90;
+
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_trial_conversion`
+OPTIONS (description = "Power BI view over rpt_trial_conversion.")
+AS
+SELECT * EXCEPT(built_at)
+FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`;
+
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_trial_status`
+OPTIONS (description = "One row per special-offer free trial subscription: start_date, tier, days_in, and live status (active / converted / lapsed) derived directly from fact_subscriptions and fact_transactions.")
+AS
+WITH paid_sub_tx AS (
+  SELECT
+    subscription_key,
+    MIN(purchase_date) AS first_paid_date,
+    COUNT(*) AS paid_payments,
+    ROUND(SUM(revenue_gbp), 2) AS paid_revenue_gbp
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`
+  WHERE subscription_key IS NOT NULL
+    AND revenue_gbp > 0
+    AND NOT IFNULL(is_free_entry, FALSE)
+  GROUP BY subscription_key
+)
+SELECT
+  s.subscription_key,
+  s.customer_key,
+  s.created_date AS start_date,
+  DATE_TRUNC(s.created_date, MONTH) AS cohort,
+  COALESCE(
+    m.tier_name,
+    CASE
+      WHEN s.monthly_value_gbp IN (10, 15) THEN 'Bronze'
+      WHEN s.monthly_value_gbp IN (20, 25, 30) THEN 'Silver'
+      WHEN s.monthly_value_gbp IN (35, 50) THEN 'Gold'
+      WHEN s.monthly_value_gbp IN (55, 75) THEN 'Platinum'
+      ELSE 'Other'
+    END
+  ) AS tier,
+  COALESCE(
+    m.tier_band,
+    CASE
+      WHEN s.monthly_value_gbp < 20 THEN 'Low'
+      WHEN s.monthly_value_gbp < 40 THEN 'Mid'
+      WHEN s.monthly_value_gbp < 60 THEN 'High'
+      ELSE 'Very High'
+    END
+  ) AS tier_band,
+  s.monthly_value_gbp,
+  DATE_DIFF(CURRENT_DATE('Europe/London'), s.created_date, DAY) AS days_in,
+  CASE
+    WHEN p.subscription_key IS NOT NULL THEN 'converted'
+    WHEN s.status = 'ACTIVE' THEN 'active'
+    ELSE 'lapsed'
+  END AS status,
+  p.first_paid_date AS converted_date,
+  IF(
+    p.subscription_key IS NOT NULL,
+    GREATEST(DATE_DIFF(p.first_paid_date, s.created_date, DAY), 0),
+    NULL
+  ) AS days_to_convert,
+  COALESCE(p.paid_payments, 0) AS paid_payments,
+  COALESCE(p.paid_revenue_gbp, NUMERIC '0.00') AS paid_revenue_gbp,
+  s.status AS subscription_status_raw
+FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_subscriptions` s
+LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.dim_subscription_model` m
+  ON s.subscription_model_key = m.subscription_model_key
+LEFT JOIN paid_sub_tx p
+  ON s.subscription_key = p.subscription_key
+WHERE s.is_special_offer_trial;
+
+
 -- DAILY TESTS
 -- =====================================================================
 
@@ -2487,6 +2683,38 @@ tagging_exc AS (
       )
     GROUP BY campaign_name
   )
+),
+trial_conversion_quality AS (
+  SELECT
+    (SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(cohort AS STRING), '|', tier))
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`) AS dup_rows,
+    ROUND(CAST(COALESCE(w.cvr_7d_ago, 0) * 100 AS NUMERIC), 2) AS cvr_7d_ago_pct,
+    ROUND(CAST(COALESCE(w.cvr_now, 0) * 100 AS NUMERIC), 2) AS cvr_now_pct,
+    ROUND(CAST(ABS(COALESCE(w.cvr_now, 0) - COALESCE(w.cvr_7d_ago, 0)) * 100 AS NUMERIC), 2) AS wow_shift_pp
+  FROM (
+    WITH paid_sub_tx AS (
+      SELECT subscription_key, MIN(purchase_date) AS first_paid_date
+      FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`
+      WHERE subscription_key IS NOT NULL AND revenue_gbp > 0 AND NOT IFNULL(is_free_entry, FALSE)
+      GROUP BY subscription_key
+    ),
+    t AS (
+      SELECT s.created_date AS start_date, p.first_paid_date
+      FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_subscriptions` s
+      LEFT JOIN paid_sub_tx p USING (subscription_key)
+      WHERE s.is_special_offer_trial
+    )
+    SELECT
+      SAFE_DIVIDE(
+        COUNTIF(start_date BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 90 DAY) AND CURRENT_DATE('Europe/London') AND first_paid_date IS NOT NULL),
+        COUNTIF(start_date BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 90 DAY) AND CURRENT_DATE('Europe/London'))
+      ) AS cvr_now,
+      SAFE_DIVIDE(
+        COUNTIF(start_date BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 97 DAY) AND DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 7 DAY) AND first_paid_date <= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 7 DAY)),
+        COUNTIF(start_date BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 97 DAY) AND DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 7 DAY))
+      ) AS cvr_7d_ago
+    FROM t
+  ) w
 )
 SELECT v_run_ts, DATE(v_run_ts), 'revenue_parity',   'HARD', IF(ABS(s.gbp - c.gbp) < 0.005, 'PASS', 'FAIL'), ROUND(CAST(s.gbp AS NUMERIC), 2), c.gbp, 'All ACCEPTED orders, £, penny-exact' FROM src_tx s, cur_tx c
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'row_parity',     'HARD', IF(s.n = c.n, 'PASS', 'FAIL'), s.n, c.n, 'ACCEPTED order count' FROM src_tx s, cur_tx c
@@ -2562,7 +2790,13 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_early_warning_spike', 'WARN
                IF(test_result = 'WARN',
                   'GA4 visits jumped without orders; possible tracking change',
                   CONCAT('Yesterday GA4 visits/orders ratio (', CAST(divergence_ratio AS STRING), ') in line with 4-week weekday median'))
-FROM early_warning_tracking;
+FROM early_warning_tracking
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'trial_conversion_no_duplicates', 'HARD',
+               IF(dup_rows = 0, 'PASS', 'FAIL'), 0, dup_rows,
+               'Zero duplicate (cohort, tier) rows in rpt_trial_conversion' FROM trial_conversion_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'trial_conversion_90d_wow_shift', 'WARN',
+               IF(wow_shift_pp <= 5.0, 'PASS', 'WARN'), cvr_7d_ago_pct, cvr_now_pct,
+               CONCAT('Trailing 90-day trial CVR week-on-week shift = ', CAST(wow_shift_pp AS STRING), ' pp (limit 5.0 pp)') FROM trial_conversion_quality;
 
 -- Order-status parity is its own statement: BigQuery allows only ONE
 -- snapshot time per source table per statement, and this table was built
@@ -2611,7 +2845,11 @@ BEGIN
     ('rpt_visit_source_daily', 'ga4_complete', 'Whether this date was loaded from a finalized GA4 daily table events_YYYYMMDD (TRUE).', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_paid_media_entity_daily', 'spend', 'Platform-reported ad spend excluding VAT in pounds.', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_paid_media_entity_daily', 'spend_inc_vat', 'Platform-reported ad spend including 20% UK VAT in pounds: ROUND(spend * 1.2, 2).', 'none', 'approved', CURRENT_TIMESTAMP()),
-    ('rpt_paid_media_entity_daily', 'adj_rev', 'Subscription starts revalued at £50/£80/£105/£110 by plan tier plus actual non-sub revenue for Google entities; 0.0 for non-Google.', 'none', 'approved', CURRENT_TIMESTAMP())
+    ('rpt_paid_media_entity_daily', 'adj_rev', 'Subscription starts revalued at £50/£80/£105/£110 by plan tier plus actual non-sub revenue for Google entities; 0.0 for non-Google.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_trial_conversion', 'conversion_rate', 'Realised trial-to-paid conversion rate for cohort x tier: ROUND(converted / trials, 4).', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_trial_conversion', 'median_days', 'Median days from free-trial start_date to first paid subscription transaction for converted trials in cohort x tier.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_trial_conversion', 'trailing_90d_conversion_rate', 'Trailing 90-day trial conversion rate for tier, with fallback to overall trailing 90-day rate when tier has < 30 trials.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('vw_trial_status', 'status', 'Live trial status derived from fact_subscriptions and fact_transactions: active, converted, or lapsed.', 'none', 'approved', CURRENT_TIMESTAMP())
   ])) S
   ON T.table_name = S.table_name AND T.column_name = S.column_name
   WHEN MATCHED THEN UPDATE SET description = S.description, pii_level = S.pii_level, status = S.status, updated_at = S.updated_at

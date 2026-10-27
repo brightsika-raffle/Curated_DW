@@ -16,6 +16,7 @@ PROJECT = "rh-ga4-491819"
 LOCATION = "europe-west2"
 SA = "rh-data-pipeline-rh-ga4-491819@rh-ga4-491819.iam.gserviceaccount.com"
 TRANSFER_CONFIG_NAME = "projects/613976204637/locations/europe-west2/transferConfigs/6abf66d9-0000-2436-a7b2-14c14ef3c450"
+LTV_CONFIG_NAME = "projects/613976204637/locations/europe-west2/transferConfigs/6ae09451-0000-271c-b631-34c7e9450713"
 
 def get_user_token():
     env = os.environ.copy()
@@ -35,35 +36,23 @@ def get_sa_token():
     )
     return res.stdout.strip().splitlines()[-1].strip()
 
-def main():
-    with open("nightly_build_and_test.sql", "r", encoding="utf-8") as f:
-        sql = f.read()
-
-    # Also keep nightly_build_and_test_live_scheduled.sql in sync
-    with open("nightly_build_and_test_live_scheduled.sql", "w", encoding="utf-8") as f:
-        f.write(sql)
-
-    sa_token = get_sa_token()
-    bq_client = bigquery.Client(project=PROJECT, credentials=Credentials(sa_token), location=LOCATION)
-
-    # Dry run the full nightly script first (Rule 5)
+def dry_run_stmt(bq_client, label, stmt_sql):
     job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False, labels={"datacloud": "antigravity"})
-    dry_job = bq_client.query(sql, job_config=job_config)
-    total_bytes = dry_job.total_bytes_processed
-    print(f"Nightly build dry-run bytes: {total_bytes:,} bytes ({total_bytes / (1024**2):.2f} MB / {total_bytes / (1024**3):.4f} GB)")
-    if total_bytes > 1024**3:
-        raise RuntimeError(f"Dry run exceeds 1 GB limit: {total_bytes}")
+    dry_job = bq_client.query(stmt_sql, job_config=job_config)
+    b = dry_job.total_bytes_processed
+    print(f"Dry-run [{label}]: {b:,} bytes ({b / (1024**2):.2f} MB / {b / (1024**3):.4f} GB)")
+    if b > 1024**3:
+        raise RuntimeError(f"Dry run [{label}] exceeds 1 GB limit: {b}")
+    return b
 
-    user_token = get_user_token()
-    dts_client = bigquery_datatransfer_v1.DataTransferServiceClient(credentials=Credentials(user_token))
-
-    config = dts_client.get_transfer_config(name=TRANSFER_CONFIG_NAME)
+def backup_and_update_config(dts_client, config_name, file_prefix, new_sql):
+    config = dts_client.get_transfer_config(name=config_name)
     ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
     date_dir = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     backup_dir = f"backups/scheduled_queries/{date_dir}"
     os.makedirs(backup_dir, exist_ok=True)
-    backup_sql_path = f"{backup_dir}/nightly_build_and_test_{ts_str}.sql"
-    backup_cfg_path = f"{backup_dir}/nightly_build_and_test_{ts_str}.json"
+    backup_sql_path = f"{backup_dir}/{file_prefix}_{ts_str}.sql"
+    backup_cfg_path = f"{backup_dir}/{file_prefix}_{ts_str}.json"
 
     with open(backup_sql_path, "w", encoding="utf-8") as bf:
         bf.write(config.params.get("query", ""))
@@ -76,28 +65,30 @@ def main():
             "backed_up_at": ts_str,
         }, cf, indent=2)
 
-    print(f"Backup SQL path: {backup_sql_path}")
-    print(f"Backup config path: {backup_cfg_path}")
+    print(f"Backup SQL path ({file_prefix}): {backup_sql_path}")
+    print(f"Backup config path ({file_prefix}): {backup_cfg_path}")
 
     params = dict(config.params)
-    params["query"] = sql
+    params["query"] = new_sql
     config.params = params
 
     update_mask = field_mask_pb2.FieldMask(paths=["params"])
     updated = dts_client.update_transfer_config(transfer_config=config, update_mask=update_mask)
     print(f"Updated transfer config: {updated.display_name} ({updated.name})")
+    return backup_sql_path, backup_cfg_path
 
+def trigger_and_wait(dts_client, config_name, label):
     now = datetime.now(timezone.utc)
     ts = timestamp_pb2.Timestamp()
     ts.FromDatetime(now)
     req = bigquery_datatransfer_v1.StartManualTransferRunsRequest(
-        parent=TRANSFER_CONFIG_NAME,
+        parent=config_name,
         requested_run_time=ts
     )
     res = dts_client.start_manual_transfer_runs(request=req)
-    run = res.runs[0] if res.runs else list(dts_client.list_transfer_runs(parent=TRANSFER_CONFIG_NAME, page_size=5))[0]
+    run = res.runs[0] if res.runs else list(dts_client.list_transfer_runs(parent=config_name, page_size=5))[0]
     run_name = run.name
-    print(f"Triggered manual run: {run_name}")
+    print(f"Triggered manual run [{label}]: {run_name}")
 
     start_time = time.time()
     while True:
@@ -108,14 +99,76 @@ def main():
         time.sleep(10)
 
     elapsed = int(time.time() - start_time)
-    print(f"Manual nightly run finished in {elapsed}s with state: {state_str}")
+    print(f"Manual run [{label}] finished in {elapsed}s with state: {state_str}")
     if state_str != "SUCCEEDED":
         print(f"Error status: {r.error_status}")
-        raise RuntimeError(f"Manual nightly run failed: {state_str}")
+        raise RuntimeError(f"Manual run [{label}] failed: {state_str}")
+    return run_name
 
-    # Refresh token in case run took >1 min and query DQ gate results
+def main():
+    with open("nightly_build_and_test.sql", "r", encoding="utf-8") as f:
+        sql = f.read()
+
+    with open("nightly_build_and_test_live_scheduled.sql", "w", encoding="utf-8") as f:
+        f.write(sql)
+
+    with open(os.path.join("Claude outputs", "ltv_horizons.sql"), "r", encoding="utf-8") as f:
+        ltv_sql = f.read()
+
     sa_token = get_sa_token()
     bq_client = bigquery.Client(project=PROJECT, credentials=Credentials(sa_token), location=LOCATION)
+
+    # Dry run individual statements and full script (Rule 5)
+    dry_run_stmt(bq_client, "nightly_build_and_test.sql (script syntax check)", sql)
+    dry_run_stmt(bq_client, "customer_ltv_horizons.sql", ltv_sql)
+
+    # Extract Section 16 & Section 17 statements to print their individual dry-run bytes
+    import re
+    s16_start = sql.index("-- SECTION 16")
+    s17_start = sql.index("-- SECTION 17")
+    s_tests = sql.index("-- DAILY TESTS")
+    for idx, stmt in enumerate([s.strip() for s in re.split(r";\s*\r?\n", sql[s16_start:s17_start]) if "SELECT" in s.upper()], 1):
+        dry_run_stmt(bq_client, f"Section 16 stmt {idx}", stmt)
+    for idx, stmt in enumerate([s.strip() for s in re.split(r";\s*\r?\n", sql[s17_start:s_tests]) if "SELECT" in s.upper()], 1):
+        dry_run_stmt(bq_client, f"Section 17 stmt {idx}", stmt)
+    dry_run_stmt(bq_client, "SELECT * FROM vw_trial_status", "SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_trial_status`")
+
+    user_token = get_user_token()
+    dts_client = bigquery_datatransfer_v1.DataTransferServiceClient(credentials=Credentials(user_token))
+
+    # 1. Backup and update customer_ltv_horizons nightly
+    backup_and_update_config(dts_client, LTV_CONFIG_NAME, "customer_ltv_horizons", ltv_sql)
+    trigger_and_wait(dts_client, LTV_CONFIG_NAME, "customer_ltv_horizons nightly")
+
+    # 2. Backup and update rh_curated nightly build + tests
+    user_token = get_user_token()
+    dts_client = bigquery_datatransfer_v1.DataTransferServiceClient(credentials=Credentials(user_token))
+    backup_and_update_config(dts_client, TRANSFER_CONFIG_NAME, "nightly_build_and_test", sql)
+    trigger_and_wait(dts_client, TRANSFER_CONFIG_NAME, "rh_curated nightly build + tests")
+
+    # 3. Query DQ gate results and INFORMATION_SCHEMA job bytes
+    sa_token = get_sa_token()
+    bq_client = bigquery.Client(project=PROJECT, credentials=Credentials(sa_token), location=LOCATION)
+
+    q_jobs = """
+    SELECT
+      job_id,
+      creation_time,
+      total_bytes_processed,
+      total_bytes_billed
+    FROM `rh-ga4-491819`.`region-europe-west2`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+    WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
+      AND statement_type = 'SCRIPT'
+      AND state = 'DONE'
+    ORDER BY creation_time DESC
+    LIMIT 2
+    """
+    try:
+        for j in bq_client.query(q_jobs, job_config=bigquery.QueryJobConfig(labels={"datacloud": "antigravity"})).result():
+            print(f"Script Job {j['job_id']} ({j['creation_time']}): processed={j['total_bytes_processed']:,} bytes ({j['total_bytes_processed']/(1024**2):.2f} MB), billed={j['total_bytes_billed']:,} bytes ({j['total_bytes_billed']/(1024**2):.2f} MB)")
+    except Exception as e:
+        print(f"Note: INFORMATION_SCHEMA.JOBS_BY_PROJECT lookup: {e}")
+
     q_tests = """
     SELECT
       run_ts,
@@ -143,4 +196,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
