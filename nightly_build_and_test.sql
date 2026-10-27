@@ -854,6 +854,9 @@ CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_transaction
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_wh_daily`    AS SELECT * EXCEPT(built_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_wh_daily`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_page_daily`  AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_daily`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_page_status` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_page_status`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_paid_media_entity`       AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_paid_media_entity`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_daily` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_status` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_status`;
 
 
 
@@ -1506,6 +1509,506 @@ CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_tracking_cov
 SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`;
 
 
+-- =====================================================================
+-- SECTION 16 — dim_paid_media_entity, rpt_paid_media_entity_daily & rpt_paid_media_entity_status
+-- Nightly rebuild of paid media report at entity grain (Jordan's report)
+-- from 2026-09-01 to yesterday across first (F) and last (L) touch bases.
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.dim_paid_media_entity`
+OPTIONS (description = "Paid media entity dimension. One row per reporting entity (totals, groups, campaigns). Rebuilt nightly.")
+AS
+WITH
+meta_names AS (
+  SELECT campaign_id, ANY_VALUE(campaign_name) AS campaign_name
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`
+  GROUP BY 1
+),
+meta_summary AS (
+  SELECT 
+    campaign_id,
+    SUM(spend_gbp) AS tot_spend,
+    COUNT(DISTINCT IF(spend_gbp > 0 AND spend_date >= DATE '2026-09-01', spend_date, NULL)) AS n_spend_days,
+    MIN(IF(spend_gbp > 0 AND spend_date >= DATE '2026-09-01', spend_date, NULL)) AS min_spend_date,
+    MIN(spend_date) AS active_from,
+    MAX(spend_date) AS active_to
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`
+  WHERE spend_date >= DATE '2026-09-01'
+  GROUP BY 1
+),
+meta_qualified AS (
+  SELECT
+    s.campaign_id,
+    n.campaign_name,
+    CASE 
+      WHEN REGEXP_CONTAINS(LOWER(n.campaign_name), r'rtg') THEN 'RTG'
+      WHEN REGEXP_CONTAINS(LOWER(n.campaign_name), r'rmg|remarket') THEN 'RMG'
+      ELSE 'PR'
+    END AS grp,
+    s.active_from,
+    s.active_to,
+    (s.n_spend_days = 1 AND s.min_spend_date = DATE '2026-09-10') AS is_legacy
+  FROM meta_summary s
+  JOIN meta_names n ON s.campaign_id = n.campaign_id
+  WHERE s.tot_spend > 100
+),
+static_entities AS (
+  SELECT 'ps' AS entity_id, 'Paid Social' AS name, 'total' AS kind, CAST(NULL AS STRING) AS parent_id, 'PR' AS grp, FALSE AS wordseed, TRUE AS in_parent_total, DATE '2026-09-01' AS active_from, DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY) AS active_to
+  UNION ALL SELECT 'ps-pr', 'Paid Social PR', 'group', 'ps', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'ps-rmg', 'Paid Social RMG', 'group', 'ps', 'RMG', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'ps-rtg', 'Paid Social RTG', 'group', 'ps', 'RTG', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'ps-unk', 'Paid Social Unknown', 'group', 'ps', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'gb', 'Google and Bing', 'total', CAST(NULL AS STRING), 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'g-comp', 'Google Competitor', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'g-gen', 'Google Generic', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'g-brand', 'Google Brand', 'group', 'gb', 'PR', FALSE, FALSE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'g-dg', 'Google Demand Gen', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'g-pmax', 'Google PMAX', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'g-unk', 'Google Unknown', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'b-comp', 'Bing Competitor', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'b-gen', 'Bing Generic', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'b-unk', 'Bing Unknown', 'group', 'gb', 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  UNION ALL SELECT 'aff', 'Affiliates', 'total', CAST(NULL AS STRING), 'PR', FALSE, TRUE, DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+),
+campaign_entities AS (
+  SELECT
+    CONCAT('m', campaign_id) AS entity_id,
+    campaign_name AS name,
+    'campaign' AS kind,
+    CONCAT('ps-', LOWER(grp)) AS parent_id,
+    grp,
+    REGEXP_CONTAINS(LOWER(campaign_name), r'wordseed') AS wordseed,
+    TRUE AS in_parent_total,
+    active_from,
+    active_to
+  FROM meta_qualified
+  WHERE NOT is_legacy
+)
+SELECT * FROM static_entities
+UNION ALL
+SELECT * FROM campaign_entities;
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_status`
+OPTIONS (description = "Status table for paid media reporting showing data currency and parameters. Rebuilt nightly.")
+AS
+WITH
+p99_calc AS (
+  SELECT ROUND(APPROX_QUANTILES(ltv_3m, 100)[OFFSET(99)], 2) AS p99_v3
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons`
+)
+SELECT
+  CURRENT_TIMESTAMP() AS built_at,
+  (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`) AS wh_to,
+  (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`) AS meta_to,
+  (SELECT MAX(segments_date) FROM `rh-ga4-491819.google_ads_transfer.ads_CampaignBasicStats_6102368044`) AS google_to,
+  CAST(NULL AS DATE) AS bing_to,
+  (SELECT MAX(`Period`) FROM `rh-ga4-491819.rh_warehouse.marketing_spend_by_channel_manual_upload` WHERE `Channel Group` = 'Affiliates') AS affiliates_to,
+  p99.p99_v3,
+  DATE '2026-09-01' AS report_start,
+  DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 6 DAY) AS mat_from,
+  [DATE '2026-10-19', DATE '2026-10-24', DATE '2026-10-26'] AS change_dates
+FROM p99_calc p99;
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`
+PARTITION BY d
+CLUSTER BY basis, entity_id
+OPTIONS (description = "Paid media report at entity grain. Daily performance from 1 Sep 2026 to yesterday across first (F) and last (L) touch bases. Rolled up to groups and totals. Rebuilt nightly.")
+AS
+WITH
+-- 1. Entities
+entities AS (
+  SELECT entity_id, name, kind, parent_id, grp, wordseed, in_parent_total
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_paid_media_entity`
+),
+meta_camps AS (
+  SELECT entity_id, REPLACE(entity_id, 'm', '') AS cid, grp, name
+  FROM entities
+  WHERE kind = 'campaign'
+),
+-- 2. Full Grid: d x basis x entity_id
+calendar AS (
+  SELECT d
+  FROM UNNEST(GENERATE_DATE_ARRAY(DATE '2026-09-01', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))) AS d
+),
+bases AS (
+  SELECT 'F' AS basis UNION ALL SELECT 'L' AS basis
+),
+grid AS (
+  SELECT c.d, b.basis, e.entity_id
+  FROM calendar c
+  CROSS JOIN bases b
+  CROSS JOIN entities e
+),
+-- 3. Platform Data
+-- 3a. Meta
+meta_base AS (
+  SELECT 
+    spend_date AS d,
+    campaign_id,
+    ROUND(SUM(spend_gbp), 2) AS spend,
+    ROUND(SUM(platform_conversions), 2) AS plat_purchases,
+    ROUND(SUM(platform_conversion_value_gbp), 2) AS plat_rev,
+    SUM(impressions) AS impr,
+    SUM(clicks) AS clicks,
+    SUM(reach) AS reach
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`
+  WHERE spend_date >= DATE '2026-09-01'
+  GROUP BY 1, 2
+),
+meta_names AS (
+  SELECT campaign_id, ANY_VALUE(campaign_name) AS campaign_name
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`
+  GROUP BY 1
+),
+meta_classified AS (
+  SELECT 
+    m.d,
+    m.campaign_id,
+    m.spend,
+    m.plat_purchases,
+    m.plat_rev,
+    m.impr,
+    m.clicks,
+    m.reach,
+    mc.entity_id AS qualified_ent_id,
+    CASE 
+      WHEN REGEXP_CONTAINS(LOWER(n.campaign_name), r'rtg') THEN 'ps-rtg'
+      WHEN REGEXP_CONTAINS(LOWER(n.campaign_name), r'rmg|remarket') THEN 'ps-rmg'
+      ELSE 'ps-pr'
+    END AS group_ent_id
+  FROM meta_base m
+  JOIN meta_names n ON m.campaign_id = n.campaign_id
+  LEFT JOIN meta_camps mc ON m.campaign_id = mc.cid
+),
+meta_groups_and_camps AS (
+  -- Group (ps-pr, ps-rmg, ps-rtg)
+  SELECT d, group_ent_id AS entity_id, SUM(spend) AS spend, SUM(plat_purchases) AS plat_purchases, SUM(plat_rev) AS plat_rev, SUM(impr) AS impr, SUM(clicks) AS clicks, CAST(NULL AS INT64) AS reach FROM meta_classified GROUP BY 1, 2
+  UNION ALL
+  -- Campaign m<cid> (reach populated only at campaign level)
+  SELECT d, qualified_ent_id AS entity_id, spend, plat_purchases, plat_rev, impr, clicks, reach FROM meta_classified WHERE qualified_ent_id IS NOT NULL
+),
+meta_total AS (
+  -- Total ps strictly defined as sum of ps-* groups
+  SELECT d, 'ps' AS entity_id, ROUND(SUM(spend), 2) AS spend, ROUND(SUM(plat_purchases), 2) AS plat_purchases, ROUND(SUM(plat_rev), 2) AS plat_rev, SUM(impr) AS impr, SUM(clicks) AS clicks, CAST(NULL AS INT64) AS reach
+  FROM meta_groups_and_camps
+  WHERE entity_id IN ('ps-pr', 'ps-rmg', 'ps-rtg', 'ps-unk')
+  GROUP BY 1
+),
+-- 3b. Google
+google_names AS (
+  SELECT campaign_id, _DATA_DATE AS d,
+         ANY_VALUE(campaign_name) AS campaign_name
+  FROM `rh-ga4-491819.google_ads_transfer.ads_Campaign_6102368044`
+  GROUP BY 1, 2
+),
+google_first_name AS (
+  SELECT campaign_id,
+         ARRAY_AGG(campaign_name ORDER BY _DATA_DATE LIMIT 1)[OFFSET(0)] AS campaign_name
+  FROM `rh-ga4-491819.google_ads_transfer.ads_Campaign_6102368044`
+  GROUP BY 1
+),
+google_base AS (
+  SELECT
+    s.segments_date AS d,
+    COALESCE(n.campaign_name, f.campaign_name) AS campaign_name,
+    ROUND(SUM(CAST(s.metrics_cost_micros AS NUMERIC) / 1000000), 2) AS spend,
+    ROUND(SUM(s.metrics_conversions), 2) AS plat_purchases,
+    ROUND(SUM(CAST(s.metrics_conversions_value AS NUMERIC)), 2) AS plat_rev,
+    SUM(s.metrics_impressions) AS impr,
+    SUM(s.metrics_clicks) AS clicks
+  FROM `rh-ga4-491819.google_ads_transfer.ads_CampaignBasicStats_6102368044` s
+  LEFT JOIN google_names n      ON n.campaign_id = s.campaign_id AND n.d = s.segments_date
+  LEFT JOIN google_first_name f ON f.campaign_id = s.campaign_id
+  WHERE s.segments_date >= DATE '2026-09-01'
+  GROUP BY 1, 2
+),
+google_groups AS (
+  SELECT
+    d,
+    CASE 
+      WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'competitor') THEN 'g-comp'
+      WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'generic') THEN 'g-gen'
+      WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'brand') THEN 'g-brand'
+      WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'pmax|performance') THEN 'g-pmax'
+      WHEN REGEXP_CONTAINS(LOWER(campaign_name), r'demand|dgen|( |_|-)dg( |_|-|$)') THEN 'g-dg'
+      ELSE 'g-unk'
+    END AS entity_id,
+    ROUND(SUM(spend), 2) AS spend, 
+    ROUND(SUM(plat_purchases), 2) AS plat_purchases, 
+    ROUND(SUM(plat_rev), 2) AS plat_rev, 
+    SUM(impr) AS impr, 
+    SUM(clicks) AS clicks,
+    CAST(NULL AS INT64) AS reach
+  FROM google_base
+  GROUP BY 1, 2
+),
+gb_total AS (
+  -- Total gb strictly defined as sum of children in_parent_total (g-* except brand, plus b-*)
+  SELECT d, 'gb' AS entity_id, ROUND(SUM(spend), 2) AS spend, ROUND(SUM(plat_purchases), 2) AS plat_purchases, ROUND(SUM(plat_rev), 2) AS plat_rev, SUM(impr) AS impr, SUM(clicks) AS clicks, CAST(NULL AS INT64) AS reach
+  FROM google_groups
+  WHERE entity_id IN ('g-comp', 'g-gen', 'g-dg', 'g-pmax', 'g-unk') -- b-* has 0 spend
+  GROUP BY 1
+),
+-- 3c. Affiliates
+aff_base AS (
+  SELECT
+    `Period` AS d,
+    'aff' AS entity_id,
+    ROUND(SUM(CAST(`Cost` AS NUMERIC)), 2) AS spend,
+    0.0 AS plat_purchases,
+    0.0 AS plat_rev,
+    0 AS impr,
+    0 AS clicks,
+    CAST(NULL AS INT64) AS reach
+  FROM `rh-ga4-491819.rh_warehouse.marketing_spend_by_channel_manual_upload`
+  WHERE `Period` >= DATE '2026-09-01'
+    AND LOWER(`Channel Group`) LIKE '%affiliate%'
+  GROUP BY 1
+),
+platform_all AS (
+  SELECT * FROM meta_groups_and_camps
+  UNION ALL SELECT * FROM meta_total
+  UNION ALL SELECT * FROM google_groups
+  UNION ALL SELECT * FROM gb_total
+  UNION ALL SELECT * FROM aff_base
+),
+platform_daily AS (
+  SELECT
+    d,
+    entity_id,
+    ROUND(SUM(spend), 2) AS spend,
+    ROUND(SUM(plat_purchases), 2) AS plat_purchases,
+    ROUND(SUM(plat_rev), 2) AS plat_rev,
+    SUM(impr) AS impr,
+    SUM(clicks) AS clicks,
+    MAX(reach) AS reach
+  FROM platform_all
+  GROUP BY 1, 2
+),
+
+-- 4. Warehouse Data
+p99_calc AS (
+  SELECT APPROX_QUANTILES(ltv_3m, 100)[OFFSET(99)] AS p99_v3
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons`
+),
+raw_touches AS (
+  SELECT
+    t.transaction_id,
+    t.purchase_date,
+    t.customer_key,
+    t.revenue_gbp,
+    t.is_first_purchase,
+    (t.is_subscription_payment OR t.order_type = 'SUBSCRIPTION') AS is_sub,
+    IFNULL(t.is_free_entry, FALSE) AS is_free_entry,
+    t.subscription_key,
+    m.tier_band,
+    h.ltv_3m,
+    -- Basis F
+    COALESCE(touch.first_touch_url, touch.last_touch_url) AS f_url,
+    COALESCE(touch.first_touch_timestamp, touch.last_touch_timestamp) AS f_ts,
+    -- Basis L
+    touch.last_touch_url AS l_url,
+    touch.last_touch_timestamp AS l_ts
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions` t
+  JOIN `rh-ga4-491819.rh_curated_Bright_Test.fact_transaction_touch` touch
+    ON t.transaction_id = touch.transaction_id
+  LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.fact_subscriptions` s
+    ON t.subscription_key = s.subscription_key
+  LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.dim_subscription_model` m
+    ON s.subscription_model_key = m.subscription_model_key
+  LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons` h
+    ON t.customer_key = h.customer_key
+  WHERE t.purchase_date >= DATE '2026-09-01'
+    AND touch.attribution_basis != 'inherited_from_subscription_signup'
+    AND t.customer_key != 'UNKNOWN_DELETED'
+),
+unioned_touches AS (
+  SELECT 'F' AS basis, r.* EXCEPT(f_url, f_ts, l_url, l_ts), f_url AS url, f_ts AS touch_ts FROM raw_touches r
+  UNION ALL
+  SELECT 'L' AS basis, r.* EXCEPT(f_url, f_ts, l_url, l_ts), l_url AS url, l_ts AS touch_ts FROM raw_touches r
+),
+filtered_touches AS (
+  SELECT 
+    t.*,
+    DATE(t.touch_ts, 'Europe/London') AS click_date,
+    LOWER(REPLACE(t.url, '%3F', '?')) AS l_url,
+    -- URL extraction
+    REGEXP_EXTRACT(t.url, r'[?&]rh_campaign_id=([0-9]+)') AS rh_cid,
+    REGEXP_EXTRACT(t.url, r'[?&]utm_campaign=([^&#]+)') AS utm_camp,
+    REGEXP_EXTRACT(t.url, r'[?&]utm_id=([0-9]+)') AS utm_id_num,
+    REGEXP_EXTRACT(t.url, r'[?&]gad_campaignid=([0-9]+)') AS gad_cid,
+    REGEXP_EXTRACT(t.url, r'[?&]tw_campaign=([0-9]+)') AS tw_cid
+  FROM unioned_touches t
+  WHERE t.touch_ts IS NOT NULL
+    AND DATE_DIFF(t.purchase_date, DATE(t.touch_ts, 'Europe/London'), DAY) BETWEEN 0 AND 7
+    AND DATE(t.touch_ts, 'Europe/London') >= DATE '2026-09-01'
+    AND DATE(t.touch_ts, 'Europe/London') <= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+),
+all_google_camps AS (
+  SELECT campaign_id, ANY_VALUE(campaign_name) AS campaign_name
+  FROM `rh-ga4-491819.google_ads_transfer.ads_Campaign_6102368044`
+  GROUP BY 1
+),
+classified_touches AS (
+  SELECT
+    t.*,
+    -- Channel classification
+    CASE 
+      WHEN REGEXP_CONTAINS(l_url, r'mentionme') THEN 'Referral'
+      WHEN REGEXP_CONTAINS(l_url, r'[?&]utm_source=affiliate|[?&]utm_medium=affiliate|[?&]clickref=') THEN 'Affiliates'
+      WHEN REGEXP_CONTAINS(l_url, r'[?&]utm_source=klaviyo|[?&]utm_medium=email') THEN 'Email'
+      WHEN REGEXP_CONTAINS(l_url, r'[?&]utm_source=attentive|[?&]utm_medium=sms') THEN 'SMS'
+      WHEN REGEXP_CONTAINS(l_url, r'[?&](gclid|gbraid|wbraid|gad_source|gad_campaignid)=|[?&]utm_source=google') THEN 'Google'
+      WHEN REGEXP_CONTAINS(l_url, r'[?&]msclkid=|[?&]utm_source=bing|[?&]utm_source=microsoft') THEN 'Bing'
+      WHEN REGEXP_CONTAINS(l_url, r'[?&]fbclid=|[?&]utm_source=(facebook|fb|ig|instagram|meta)|[?&]utm_medium=social|[?&]utm_medium=paid_social') THEN 'Paid Social'
+      ELSE 'Other'
+    END AS channel,
+    -- Customer Type
+    CONCAT(IF(t.is_first_purchase, 'N', 'E'), IF(t.is_sub, 'S', 'O')) AS ct,
+    COALESCE(t.rh_cid, IF(REGEXP_CONTAINS(t.utm_camp, r'^[0-9]+$'), t.utm_camp, NULL), t.utm_id_num) AS extracted_meta_cid,
+    COALESCE(gc1.campaign_name, gc2.campaign_name, gc3.campaign_name, t.utm_camp) AS extracted_google_camp_name
+  FROM filtered_touches t
+  LEFT JOIN all_google_camps gc1 ON CAST(t.gad_cid AS INT64) = gc1.campaign_id
+  LEFT JOIN all_google_camps gc2 ON CAST(t.tw_cid AS INT64) = gc2.campaign_id
+  LEFT JOIN all_google_camps gc3 ON t.utm_camp = gc3.campaign_name
+),
+with_entity_ids AS (
+  SELECT
+    c.*,
+    -- Entity IDs array
+    CASE 
+      WHEN c.channel = 'Paid Social' THEN
+        CASE 
+          WHEN mc.entity_id IS NOT NULL THEN ['ps', CONCAT('ps-', LOWER(mc.grp)), mc.entity_id]
+          WHEN REGEXP_CONTAINS(LOWER(c.utm_camp), r'rtg') THEN ['ps', 'ps-rtg']
+          WHEN REGEXP_CONTAINS(LOWER(c.utm_camp), r'rmg|remarket') THEN ['ps', 'ps-rmg']
+          ELSE ['ps', 'ps-pr']
+        END
+      WHEN c.channel = 'Google' THEN
+        CASE 
+          WHEN REGEXP_CONTAINS(LOWER(IFNULL(c.extracted_google_camp_name, '')), r'competitor') THEN ['gb', 'g-comp']
+          WHEN REGEXP_CONTAINS(LOWER(IFNULL(c.extracted_google_camp_name, '')), r'generic') THEN ['gb', 'g-gen']
+          WHEN REGEXP_CONTAINS(LOWER(IFNULL(c.extracted_google_camp_name, '')), r'brand') THEN ['g-brand'] -- g-brand NOT in gb
+          WHEN REGEXP_CONTAINS(LOWER(IFNULL(c.extracted_google_camp_name, '')), r'pmax|performance') THEN ['gb', 'g-pmax']
+          WHEN REGEXP_CONTAINS(LOWER(IFNULL(c.extracted_google_camp_name, '')), r'demand|dgen|( |_|-)dg( |_|-|$)') THEN ['gb', 'g-dg']
+          ELSE ['gb', 'g-unk']
+        END
+      WHEN c.channel = 'Bing' THEN
+        CASE 
+          WHEN REGEXP_CONTAINS(LOWER(c.utm_camp), r'competitor') THEN ['gb', 'b-comp']
+          WHEN REGEXP_CONTAINS(LOWER(c.utm_camp), r'generic') THEN ['gb', 'b-gen']
+          ELSE ['gb', 'b-unk']
+        END
+      WHEN c.channel = 'Affiliates' THEN ['aff']
+      ELSE []
+    END AS entity_ids
+  FROM classified_touches c
+  LEFT JOIN meta_camps mc ON c.extracted_meta_cid = mc.cid
+  WHERE c.channel IN ('Paid Social', 'Google', 'Bing', 'Affiliates')
+),
+unnested AS (
+  SELECT
+    w.basis,
+    w.click_date AS d,
+    ent_id,
+    w.transaction_id,
+    w.customer_key,
+    w.revenue_gbp,
+    w.is_first_purchase,
+    w.is_free_entry,
+    w.ct,
+    w.tier_band,
+    w.ltv_3m
+  FROM with_entity_ids w,
+  UNNEST(w.entity_ids) AS ent_id
+),
+wh_daily AS (
+  SELECT
+    u.d,
+    u.basis,
+    u.ent_id AS entity_id,
+    COUNT(*) AS wh_n,
+    COUNTIF(u.is_free_entry) AS wh_nt,
+    ROUND(SUM(u.revenue_gbp), 2) AS wh_rev,
+    COUNTIF(u.revenue_gbp >= 200) AS n200,
+    ROUND(SUM(IF(u.revenue_gbp >= 200, u.revenue_gbp, 0)), 2) AS r200,
+    ROUND(MAX(u.revenue_gbp), 2) AS max_order,
+    COUNT(DISTINCT IF(u.is_first_purchase, u.customer_key, NULL)) AS new_cust,
+    ROUND(SUM(IF(u.is_first_purchase, LEAST(u.ltv_3m, p.p99_v3), 0)), 2) AS v3,
+    COUNTIF(u.ct = 'NO') AS no_n,
+    ROUND(SUM(IF(u.ct = 'NO', u.revenue_gbp, 0)), 2) AS no_rev,
+    COUNTIF(u.ct = 'NS') AS ns_n,
+    ROUND(SUM(IF(u.ct = 'NS', u.revenue_gbp, 0)), 2) AS ns_rev,
+    COUNTIF(u.ct = 'ER') AS er_n,
+    ROUND(SUM(IF(u.ct = 'ER', u.revenue_gbp, 0)), 2) AS er_rev,
+    COUNTIF(u.ct = 'ES') AS es_n,
+    ROUND(SUM(IF(u.ct = 'ES', u.revenue_gbp, 0)), 2) AS es_rev,
+    COUNTIF(u.ct IN ('NS', 'ES') AND u.tier_band = 'Low') AS tier_low,
+    COUNTIF(u.ct IN ('NS', 'ES') AND u.tier_band = 'Mid') AS tier_mid,
+    COUNTIF(u.ct IN ('NS', 'ES') AND u.tier_band = 'High') AS tier_high,
+    COUNTIF(u.ct IN ('NS', 'ES') AND u.tier_band = 'Very High') AS tier_vhigh,
+    -- Google adjusted revenue: subscription starts revalued at £50/£80/£105/£110 by tier band plus actual non-sub revenue; equals wh_rev for non-Google
+    ROUND(SUM(
+      CASE 
+        WHEN u.ent_id IN ('gb', 'g-comp', 'g-gen', 'g-brand', 'g-dg', 'g-pmax', 'g-unk') THEN
+          CASE 
+            WHEN u.ct IN ('NS', 'ES') AND u.tier_band = 'Low' THEN 50.0
+            WHEN u.ct IN ('NS', 'ES') AND u.tier_band = 'Mid' THEN 80.0
+            WHEN u.ct IN ('NS', 'ES') AND u.tier_band = 'High' THEN 105.0
+            WHEN u.ct IN ('NS', 'ES') AND u.tier_band = 'Very High' THEN 110.0
+            ELSE u.revenue_gbp
+          END
+        ELSE u.revenue_gbp
+      END
+    ), 2) AS adj_rev
+  FROM unnested u
+  CROSS JOIN p99_calc p
+  GROUP BY 1, 2, 3
+)
+SELECT
+  g.d,
+  g.basis,
+  g.entity_id,
+  -- Platform
+  COALESCE(p.spend, 0.0) AS spend,
+  COALESCE(p.plat_purchases, 0.0) AS plat_purchases,
+  COALESCE(p.plat_rev, 0.0) AS plat_rev,
+  COALESCE(p.impr, 0) AS impr,
+  COALESCE(p.clicks, 0) AS clicks,
+  p.reach,
+  -- Warehouse
+  COALESCE(w.wh_n, 0) AS wh_n,
+  COALESCE(w.wh_nt, 0) AS wh_nt,
+  COALESCE(w.wh_rev, 0.0) AS wh_rev,
+  COALESCE(w.n200, 0) AS n200,
+  COALESCE(w.r200, 0.0) AS r200,
+  COALESCE(w.max_order, 0.0) AS max_order,
+  COALESCE(w.new_cust, 0) AS new_cust,
+  COALESCE(w.v3, 0.0) AS v3,
+  -- Customer type
+  COALESCE(w.no_n, 0) AS no_n,
+  COALESCE(w.no_rev, 0.0) AS no_rev,
+  COALESCE(w.ns_n, 0) AS ns_n,
+  COALESCE(w.ns_rev, 0.0) AS ns_rev,
+  COALESCE(w.er_n, 0) AS er_n,
+  COALESCE(w.er_rev, 0.0) AS er_rev,
+  COALESCE(w.es_n, 0) AS es_n,
+  COALESCE(w.es_rev, 0.0) AS es_rev,
+  -- Plan tiers
+  COALESCE(w.tier_low, 0) AS tier_low,
+  COALESCE(w.tier_mid, 0) AS tier_mid,
+  COALESCE(w.tier_high, 0) AS tier_high,
+  COALESCE(w.tier_vhigh, 0) AS tier_vhigh,
+  -- Adjusted
+  COALESCE(w.adj_rev, 0.0) AS adj_rev,
+  -- Flags
+  DATE_DIFF(CURRENT_DATE('Europe/London'), g.d, DAY) < 7 AS maturing,
+  CURRENT_TIMESTAMP() AS built_at
+FROM grid g
+LEFT JOIN platform_daily p ON g.d = p.d AND g.entity_id = p.entity_id
+LEFT JOIN wh_daily w ON g.d = w.d AND g.basis = w.basis AND g.entity_id = w.entity_id;
+
+
 -- DAILY TESTS
 -- =====================================================================
 
@@ -1811,6 +2314,33 @@ early_warning_tracking AS (
     LIMIT 1
   ) m
 ),
+paid_media_entity_quality AS (
+  SELECT
+    (SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(d AS STRING), '|', basis, '|', entity_id))
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`) AS dup_rows,
+    (SELECT COUNT(*)
+     FROM (
+       SELECT d, basis,
+         ROUND(SUM(IF(entity_id = 'ps', spend, 0)), 2) AS parent_ps,
+         ROUND(SUM(IF(entity_id IN ('ps-pr', 'ps-rmg', 'ps-rtg', 'ps-unk'), spend, 0)), 2) AS child_ps,
+         ROUND(SUM(IF(entity_id = 'gb', spend, 0)), 2) AS parent_gb,
+         ROUND(SUM(IF(entity_id IN ('g-comp', 'g-gen', 'g-dg', 'g-pmax', 'g-unk', 'b-comp', 'b-gen', 'b-unk'), spend, 0)), 2) AS child_gb
+       FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`
+       GROUP BY d, basis
+       HAVING ABS(parent_ps - child_ps) > 0.01 OR ABS(parent_gb - child_gb) > 0.01
+     )) AS spend_parity_diff_days,
+    (SELECT COUNTIF(wh_n < (no_n + ns_n + er_n + es_n))
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`) AS ct_parity_bad_rows,
+    (SELECT COUNT(*)
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily` r
+     LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.dim_paid_media_entity` d ON r.entity_id = d.entity_id
+     WHERE d.entity_id IS NULL) AS missing_dim_entities,
+    (SELECT GREATEST(
+       DATE_DIFF(CURRENT_DATE('Europe/London'), meta_to, DAY),
+       DATE_DIFF(CURRENT_DATE('Europe/London'), google_to, DAY)
+     )
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_status`) AS freshness_max_days_behind
+),
 tagging_exc AS (
   SELECT
     COALESCE(SUM(purchasing_visitors), 0) AS purchasing_visitors,
@@ -1877,6 +2407,21 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_page_no_duplicates', 'HAR
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_page_spend_parity', 'HARD',
                IF(spend_parity_diff_days = 0, 'PASS', 'FAIL'), 0, spend_parity_diff_days,
                'Spend on F = spend on L per day across all dates' FROM paid_media_page_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_entity_no_duplicates', 'HARD',
+               IF(dup_rows = 0, 'PASS', 'FAIL'), 0, dup_rows,
+               'Zero duplicate (d, basis, entity_id) rows in rpt_paid_media_entity_daily' FROM paid_media_entity_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_entity_parent_spend_parity', 'HARD',
+               IF(spend_parity_diff_days = 0, 'PASS', 'FAIL'), 0, spend_parity_diff_days,
+               'Parent spend equals sum of children spend within £0.01 for ps and gb' FROM paid_media_entity_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_entity_wh_customer_type_parity', 'HARD',
+               IF(ct_parity_bad_rows = 0, 'PASS', 'FAIL'), 0, ct_parity_bad_rows,
+               'wh_n >= sum of customer-type n across all rows' FROM paid_media_entity_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_entity_dim_fk', 'HARD',
+               IF(missing_dim_entities = 0, 'PASS', 'FAIL'), 0, missing_dim_entities,
+               'Every entity_id in rpt_paid_media_entity_daily exists in dim_paid_media_entity' FROM paid_media_entity_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'paid_media_entity_freshness', 'WARN',
+               IF(freshness_max_days_behind <= 2, 'PASS', 'WARN'), 2, freshness_max_days_behind,
+               'meta_to and google_to are within 2 days of today' FROM paid_media_entity_quality
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_coverage_no_duplicates', 'HARD',
                IF(dup_d = 0, 'PASS', 'FAIL'), 0, dup_d,
                'Zero duplicate d in rpt_tracking_coverage_daily' FROM tracking_coverage_quality
@@ -1934,7 +2479,8 @@ BEGIN
     ('rpt_tracking_coverage_daily', 'est_visits', 'Estimated visits before the 19 Oct banner based on page views per consented visit. Not reliable after the 19 Oct banner; do not use (NULL from 19 Oct).', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_tracking_coverage_daily', 'consent_granted_share', 'Share of landings with privacy_info.analytics_storage = Yes. Before the 19 Oct banner, remaining 6-22% were NULL (unconfigured), with 0% denied.', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_tracking_coverage_daily', 'ga4_complete', 'Whether GA4 daily export table events_YYYYMMDD has landed and been loaded for this date (excludes intraday pings).', 'none', 'approved', CURRENT_TIMESTAMP()),
-    ('rpt_visit_source_daily', 'ga4_complete', 'Whether this date was loaded from a finalized GA4 daily table events_YYYYMMDD (TRUE).', 'none', 'approved', CURRENT_TIMESTAMP())
+    ('rpt_visit_source_daily', 'ga4_complete', 'Whether this date was loaded from a finalized GA4 daily table events_YYYYMMDD (TRUE).', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_paid_media_entity_daily', 'adj_rev', 'Subscription starts revalued at £50/£80/£105/£110 by plan tier plus actual non-sub revenue for Google entities; equals wh_rev for non-Google.', 'none', 'approved', CURRENT_TIMESTAMP())
   ])) S
   ON T.table_name = S.table_name AND T.column_name = S.column_name
   WHEN MATCHED THEN UPDATE SET description = S.description, pii_level = S.pii_level, status = S.status, updated_at = S.updated_at
