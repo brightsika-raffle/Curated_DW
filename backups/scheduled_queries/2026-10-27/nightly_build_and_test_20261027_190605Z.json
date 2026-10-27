@@ -1,0 +1,7 @@
+{
+  "name": "projects/613976204637/locations/europe-west2/transferConfigs/6abf66d9-0000-2436-a7b2-14c14ef3c450",
+  "display_name": "rh_curated nightly build + tests",
+  "schedule": "every day 03:10",
+  "data_source_id": "scheduled_query",
+  "backed_up_at": "20261027_190605Z"
+}
