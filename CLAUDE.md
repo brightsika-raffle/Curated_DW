@@ -1,5 +1,8 @@
 # Standing Rules for Raffle House Data Warehouse
 
+0. **Numbers must come from code:**
+   Every number in a report back, whether ours, a reference value or a difference, must be printed by a committed script under `scripts/` that reads the sources directly (BigQuery, `data2.json` and so on). Paste the script's raw output. Never type, round or estimate a figure by hand. If a script fails, say it failed. Don't fill in values.
+
 1. **Sources stay where they are:**
    The source tables are the MongoDB/WooCommerce mirrors in `rh_warehouse` (`fact_transactions`, `fact_subscriptions`, `dim_customers`, `dim_raffles`, `dim_subscription_models`), plus `marketing_spend_by_channel_manual_upload`, the GA4 export `analytics_354198910`, `google_ads_transfer`, and the Meta API loads. Don't move or change them.
 2. **Curated warehouse reads only sources:**
