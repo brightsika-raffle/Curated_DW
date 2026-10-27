@@ -1304,13 +1304,13 @@ SELECT
   (SELECT MAX(date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`) AS site_data_to;
 
 -- =====================================================================
--- SECTION 14 — rpt_visit_source_daily  (reloads yesterday only)
+-- SECTION 14 — rpt_visit_source_daily  (reloads last 3 days from finalized events_YYYYMMDD tables)
 -- =====================================================================
 DELETE FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`
-WHERE d = DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY);
+WHERE d BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY) AND DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY);
 
 INSERT INTO `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`
-  (d, consent, channel, source, medium, landings, page_views, built_at)
+  (d, consent, channel, source, medium, landings, page_views, ga4_complete, built_at)
 WITH raw_events AS (
   SELECT
     PARSE_DATE('%Y%m%d', event_date) AS d,
@@ -1326,8 +1326,9 @@ WITH raw_events AS (
     (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
     (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_referrer') AS page_referrer
   FROM `rh-ga4-491819.analytics_354198910.events_*`
-  WHERE (_TABLE_SUFFIX = FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))
-         OR _TABLE_SUFFIX = CONCAT('intraday_', FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))))
+  WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY))
+                          AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))
+    AND _TABLE_SUFFIX NOT LIKE 'intraday_%'
     AND event_name IN ('session_start', 'page_view')
 ),
 classified_events AS (
@@ -1426,6 +1427,7 @@ SELECT
   COALESCE(l.medium, p.medium) AS medium,
   COALESCE(l.landings, 0) AS landings,
   COALESCE(p.page_views, 0) AS page_views,
+  TRUE AS ga4_complete,
   CURRENT_TIMESTAMP() AS built_at
 FROM landings_agg l
 FULL OUTER JOIN page_views_agg p
@@ -1488,11 +1490,12 @@ SELECT
   COALESCE(g.ga4_unassigned, 0) AS ga4_unassigned,
   ROUND(SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), g.ga4_sessions), 4) AS pct_unassigned,
   ROUND(SAFE_DIVIDE(v.granted_landings, v.visit_landings), 4) AS consent_granted_share,
-  CAST(ROUND(SAFE_DIVIDE(
+  IF(dt.d < DATE '2026-10-19', CAST(ROUND(SAFE_DIVIDE(
     v.total_pv,
     SAFE_DIVIDE(v.granted_pv, v.granted_landings)
-  )) AS INT64) AS est_visits,
+  )) AS INT64), NULL) AS est_visits,
   dt.d < DATE '2026-10-24' AS ga4_sessions_reliable,
+  COALESCE(g.ga4_sessions, 0) > 0 AS ga4_complete,
   CURRENT_TIMESTAMP() AS built_at
 FROM dates dt
 LEFT JOIN orders_daily o ON dt.d = o.d
@@ -1773,7 +1776,10 @@ early_warning_tracking AS (
     y.orders AS y_orders,
     m.med_sessions,
     m.med_orders,
-    IF(y.session_starts > 1.5 * m.med_sessions AND y.orders < 1.2 * m.med_orders, 'WARN', 'PASS') AS test_result
+    ROUND(SAFE_DIVIDE(y.session_starts, m.med_sessions), 2) AS session_ratio,
+    ROUND(SAFE_DIVIDE(y.orders, m.med_orders), 2) AS order_ratio,
+    ROUND(SAFE_DIVIDE(SAFE_DIVIDE(y.session_starts, m.med_sessions), SAFE_DIVIDE(y.orders, m.med_orders)), 2) AS divergence_ratio,
+    IF(SAFE_DIVIDE(SAFE_DIVIDE(y.session_starts, m.med_sessions), SAFE_DIVIDE(y.orders, m.med_orders)) > 1.5, 'WARN', 'PASS') AS test_result
   FROM (
     SELECT
       COALESCE(NULLIF(c.ga4_sessions, 0), v.landings, 0) AS session_starts,
@@ -1881,7 +1887,7 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_early_warning_spike', 'WARN
                test_result, ROUND(CAST(med_sessions AS NUMERIC), 0), y_sessions,
                IF(test_result = 'WARN',
                   'GA4 visits jumped without orders; possible tracking change',
-                  'Yesterday GA4 visits and orders in line with 4-week weekday median')
+                  CONCAT('Yesterday GA4 visits/orders ratio (', CAST(divergence_ratio AS STRING), ') in line with 4-week weekday median'))
 FROM early_warning_tracking;
 
 -- Order-status parity is its own statement: BigQuery allows only ONE
@@ -1924,7 +1930,11 @@ BEGIN
     ('fact_marketing_spend_daily', 'meta_funnel', 'Meta campaign funnel stage classified from campaign name (Prospecting, Retargeting, Remarketing, or Unknown (daily total) for manual upload). NULL for Google.', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('dim_subscription_model', 'tier_band', 'internal curve grouping; use tier_name in reports', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('dim_subscription_model', 'tier_name', 'Website subscription tier: Bronze (£10/£15), Silver (£20/£25/£30), Gold (£35/£50), Platinum (£55/£75), Other.', 'none', 'approved', CURRENT_TIMESTAMP()),
-    ('customer_ltv_horizons', 'current_tier_name', 'The website tier name of the customer active subscription (Bronze, Silver, Gold, Platinum, Other), NULL if none.', 'none', 'approved', CURRENT_TIMESTAMP())
+    ('customer_ltv_horizons', 'current_tier_name', 'The website tier name of the customer active subscription (Bronze, Silver, Gold, Platinum, Other), NULL if none.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_tracking_coverage_daily', 'est_visits', 'Estimated visits before the 19 Oct banner based on page views per consented visit. Not reliable after the 19 Oct banner; do not use (NULL from 19 Oct).', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_tracking_coverage_daily', 'consent_granted_share', 'Share of landings with privacy_info.analytics_storage = Yes. Before the 19 Oct banner, remaining 6-22% were NULL (unconfigured), with 0% denied.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_tracking_coverage_daily', 'ga4_complete', 'Whether GA4 daily export table events_YYYYMMDD has landed and been loaded for this date (excludes intraday pings).', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_visit_source_daily', 'ga4_complete', 'Whether this date was loaded from a finalized GA4 daily table events_YYYYMMDD (TRUE).', 'none', 'approved', CURRENT_TIMESTAMP())
   ])) S
   ON T.table_name = S.table_name AND T.column_name = S.column_name
   WHEN MATCHED THEN UPDATE SET description = S.description, pii_level = S.pii_level, status = S.status, updated_at = S.updated_at
