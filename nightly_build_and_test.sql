@@ -1278,6 +1278,10 @@ AS
 SELECT
   CURRENT_TIMESTAMP() AS built_at,
   DATE '2026-10-19' AS tracking_changed_on,
+  DATE '2026-10-19' AS cookie_banner_changed_on,
+  DATE '2026-10-24' AS consent_setting_changed_on,
+  DATE '2026-10-26' AS pricing_display_changed_on,
+  [DATE '2026-10-19', DATE '2026-10-24', DATE '2026-10-26'] AS change_dates,
   (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_transactions`) AS wh_to,
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'google') AS google_to,
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'meta') AS meta_to,
@@ -1290,13 +1294,149 @@ AS
 SELECT
   CURRENT_TIMESTAMP() AS built_at,
   DATE '2026-10-19' AS tracking_changed_on,
+  DATE '2026-10-19' AS cookie_banner_changed_on,
+  DATE '2026-10-24' AS consent_setting_changed_on,
+  DATE '2026-10-26' AS pricing_display_changed_on,
+  [DATE '2026-10-19', DATE '2026-10-24', DATE '2026-10-26'] AS change_dates,
   FALSE AS meta_connected,
   CAST(NULL AS DATE) AS ig_data_to,
   CAST(NULL AS DATE) AS fb_data_to,
   (SELECT MAX(date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`) AS site_data_to;
 
 -- =====================================================================
--- SECTION 14 — rpt_tracking_coverage_daily  (rebuilt nightly from 2026-09-01)
+-- SECTION 14 — rpt_visit_source_daily  (reloads yesterday only)
+-- =====================================================================
+DELETE FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`
+WHERE d = DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY);
+
+INSERT INTO `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`
+  (d, consent, channel, source, medium, landings, page_views, built_at)
+WITH raw_events AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS d,
+    event_name,
+    event_timestamp,
+    user_pseudo_id,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
+    CASE
+      WHEN privacy_info.analytics_storage = 'Yes' THEN 'granted'
+      WHEN privacy_info.analytics_storage = 'No' THEN 'denied'
+      ELSE 'unknown'
+    END AS consent,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_referrer') AS page_referrer
+  FROM `rh-ga4-491819.analytics_354198910.events_*`
+  WHERE (_TABLE_SUFFIX = FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))
+         OR _TABLE_SUFFIX = CONCAT('intraday_', FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))))
+    AND event_name IN ('session_start', 'page_view')
+),
+classified_events AS (
+  SELECT
+    *,
+    NULLIF(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')), '') AS utm_source,
+    NULLIF(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&#]+)')), '') AS utm_medium,
+    CASE
+      WHEN REGEXP_CONTAINS(LOWER(page_location), r'[?&](gclid|gbraid|wbraid|gad_source|gad_campaignid)=') THEN 'Google Ads'
+      WHEN REGEXP_CONTAINS(LOWER(page_location), r'[?&]fbclid=')
+           AND REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)') IS NULL
+           AND REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&#]+)') IS NULL THEN 'Meta (unclear paid/organic)'
+      WHEN REGEXP_CONTAINS(IFNULL(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')),''), r'mentionme') THEN 'Referral (Mention Me)'
+      WHEN LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')) = 'affiliate'
+           OR REGEXP_CONTAINS(IFNULL(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&#]+)')),''), r'affiliate')
+           OR REGEXP_CONTAINS(LOWER(page_location), r'[?&]clickref=') THEN 'Affiliate'
+      WHEN LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')) = 'klaviyo'
+           OR LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&#]+)')) = 'email' THEN 'Email'
+      WHEN LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&#]+)')) = 'sms'
+           OR REGEXP_CONTAINS(IFNULL(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')),''), r'attentive|sms') THEN 'SMS'
+      WHEN (LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')) = 'google'
+            AND REGEXP_CONTAINS(IFNULL(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&#]+)')),''), r'cpc|paid|ppc')) THEN 'Google Ads'
+      WHEN REGEXP_CONTAINS(LOWER(page_location), r'[?&]fbclid=')
+           OR REGEXP_CONTAINS(IFNULL(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')),''), r'^(facebook|fb|ig|instagram|meta)') THEN 'Meta'
+      WHEN REGEXP_CONTAINS(LOWER(page_location), r'[?&]msclkid=')
+           OR REGEXP_CONTAINS(IFNULL(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')),''), r'bing|microsoft') THEN 'Microsoft Ads'
+      WHEN REGEXP_CONTAINS(LOWER(page_location), r'[?&]ttclid=')
+           OR REGEXP_CONTAINS(IFNULL(LOWER(REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)')),''), r'tiktok') THEN 'TikTok'
+      WHEN REGEXP_CONTAINS(LOWER(page_location), r'^https?://wowcher\.') THEN 'Wowcher'
+      WHEN REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]+)') IS NOT NULL THEN 'Other tagged'
+      WHEN page_referrer IS NOT NULL AND NOT REGEXP_CONTAINS(LOWER(page_referrer), r'rafflehouse\.com') THEN
+        CASE
+          WHEN REGEXP_CONTAINS(LOWER(page_referrer), r'google\.|bing\.|yahoo\.|duckduckgo\.|ecosia\.|baidu\.|yandex\.') THEN 'Organic Search'
+          ELSE 'Referral'
+        END
+      ELSE 'Direct / untagged'
+    END AS channel
+  FROM raw_events
+),
+session_landing AS (
+  SELECT
+    user_pseudo_id,
+    ga_session_id,
+    consent,
+    channel,
+    utm_source,
+    utm_medium
+  FROM classified_events
+  WHERE user_pseudo_id IS NOT NULL AND ga_session_id IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY user_pseudo_id, ga_session_id
+    ORDER BY IF(event_name = 'session_start', 0, 1), event_timestamp ASC
+  ) = 1
+),
+landings_agg AS (
+  SELECT
+    d,
+    consent,
+    channel,
+    utm_source AS source,
+    utm_medium AS medium,
+    COUNT(*) AS landings
+  FROM classified_events
+  WHERE event_name = 'session_start'
+  GROUP BY 1, 2, 3, 4, 5
+),
+page_views_attributed AS (
+  SELECT
+    ce.d,
+    COALESCE(sl.consent, ce.consent) AS consent,
+    COALESCE(sl.channel, ce.channel) AS channel,
+    COALESCE(sl.utm_source, ce.utm_source) AS source,
+    COALESCE(sl.utm_medium, ce.utm_medium) AS medium
+  FROM classified_events ce
+  LEFT JOIN session_landing sl
+    ON ce.user_pseudo_id = sl.user_pseudo_id
+   AND ce.ga_session_id = sl.ga_session_id
+  WHERE ce.event_name = 'page_view'
+),
+page_views_agg AS (
+  SELECT
+    d,
+    consent,
+    channel,
+    source,
+    medium,
+    COUNT(*) AS page_views
+  FROM page_views_attributed
+  GROUP BY 1, 2, 3, 4, 5
+)
+SELECT
+  COALESCE(l.d, p.d) AS d,
+  COALESCE(l.consent, p.consent) AS consent,
+  COALESCE(l.channel, p.channel) AS channel,
+  COALESCE(l.source, p.source) AS source,
+  COALESCE(l.medium, p.medium) AS medium,
+  COALESCE(l.landings, 0) AS landings,
+  COALESCE(p.page_views, 0) AS page_views,
+  CURRENT_TIMESTAMP() AS built_at
+FROM landings_agg l
+FULL OUTER JOIN page_views_agg p
+  ON l.d = p.d
+ AND l.consent = p.consent
+ AND l.channel = p.channel
+ AND (l.source = p.source OR (l.source IS NULL AND p.source IS NULL))
+ AND (l.medium = p.medium OR (l.medium IS NULL AND p.medium IS NULL));
+
+-- =====================================================================
+-- SECTION 15 — rpt_tracking_coverage_daily  (rebuilt nightly from 2026-09-01)
 -- =====================================================================
 CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
 CLUSTER BY d
@@ -1327,20 +1467,37 @@ ga4_daily AS (
   FROM `rh-ga4-491819.rh_curated_Bright_Test.ga4_source_daily`
   WHERE date >= DATE '2026-09-01'
   GROUP BY 1
+),
+visit_sources AS (
+  SELECT
+    d,
+    SUM(landings) AS visit_landings,
+    SUM(page_views) AS total_pv,
+    SUM(IF(consent = 'granted', landings, 0)) AS granted_landings,
+    SUM(IF(consent = 'granted', page_views, 0)) AS granted_pv
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`
+  WHERE d >= DATE '2026-09-01'
+  GROUP BY 1
 )
 SELECT
-  d.d,
+  dt.d,
   COALESCE(o.orders, 0) AS orders,
   COALESCE(o.orders_tracked, 0) AS orders_tracked,
   ROUND(SAFE_DIVIDE(COALESCE(o.orders_tracked, 0), o.orders), 4) AS pct_tracked,
   COALESCE(g.ga4_sessions, 0) AS ga4_sessions,
   COALESCE(g.ga4_unassigned, 0) AS ga4_unassigned,
   ROUND(SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), g.ga4_sessions), 4) AS pct_unassigned,
-  CAST(NULL AS FLOAT64) AS consent_granted_share,
+  ROUND(SAFE_DIVIDE(v.granted_landings, v.visit_landings), 4) AS consent_granted_share,
+  CAST(ROUND(SAFE_DIVIDE(
+    v.total_pv,
+    SAFE_DIVIDE(v.granted_pv, v.granted_landings)
+  )) AS INT64) AS est_visits,
+  dt.d < DATE '2026-10-24' AS ga4_sessions_reliable,
   CURRENT_TIMESTAMP() AS built_at
-FROM dates d
-LEFT JOIN orders_daily o ON d.d = o.d
-LEFT JOIN ga4_daily g ON d.d = g.d;
+FROM dates dt
+LEFT JOIN orders_daily o ON dt.d = o.d
+LEFT JOIN ga4_daily g ON dt.d = g.d
+LEFT JOIN visit_sources v ON dt.d = v.d;
 
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_tracking_coverage_daily` AS
 SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`;
@@ -1610,6 +1767,44 @@ tracking_coverage_quality AS (
     (SELECT pct_tracked FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
      WHERE d = DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)) AS yesterday_pct_tracked
 ),
+early_warning_tracking AS (
+  SELECT
+    y.session_starts AS y_sessions,
+    y.orders AS y_orders,
+    m.med_sessions,
+    m.med_orders,
+    IF(y.session_starts > 1.5 * m.med_sessions AND y.orders < 1.2 * m.med_orders, 'WARN', 'PASS') AS test_result
+  FROM (
+    SELECT
+      COALESCE(NULLIF(c.ga4_sessions, 0), v.landings, 0) AS session_starts,
+      c.orders
+    FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily` c
+    LEFT JOIN (
+      SELECT d, SUM(landings) AS landings
+      FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`
+      GROUP BY 1
+    ) v ON c.d = v.d
+    WHERE c.d = DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY)
+  ) y
+  CROSS JOIN (
+    SELECT
+      PERCENTILE_CONT(COALESCE(NULLIF(c.ga4_sessions, 0), v.landings, 0), 0.5) OVER() AS med_sessions,
+      PERCENTILE_CONT(c.orders, 0.5) OVER() AS med_orders
+    FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily` c
+    LEFT JOIN (
+      SELECT d, SUM(landings) AS landings
+      FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`
+      GROUP BY 1
+    ) v ON c.d = v.d
+    WHERE c.d IN (
+      DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 8 DAY),
+      DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 15 DAY),
+      DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 22 DAY),
+      DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 29 DAY)
+    )
+    LIMIT 1
+  ) m
+),
 tagging_exc AS (
   SELECT
     COALESCE(SUM(purchasing_visitors), 0) AS purchasing_visitors,
@@ -1681,7 +1876,13 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_coverage_no_duplicates', 'H
                'Zero duplicate d in rpt_tracking_coverage_daily' FROM tracking_coverage_quality
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_coverage_pct_tracked', 'WARN',
                IF(yesterday_pct_tracked >= 0.90, 'PASS', 'WARN'), 0.90, ROUND(CAST(yesterday_pct_tracked AS NUMERIC), 4),
-               'pct_tracked for yesterday >= 0.90 (warns if cookie change reduced tracking)' FROM tracking_coverage_quality;
+               'pct_tracked for yesterday >= 0.90 (warns if cookie change reduced tracking)' FROM tracking_coverage_quality
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_early_warning_spike', 'WARN',
+               test_result, ROUND(CAST(med_sessions AS NUMERIC), 0), y_sessions,
+               IF(test_result = 'WARN',
+                  'GA4 visits jumped without orders; possible tracking change',
+                  'Yesterday GA4 visits and orders in line with 4-week weekday median')
+FROM early_warning_tracking;
 
 -- Order-status parity is its own statement: BigQuery allows only ONE
 -- snapshot time per source table per statement, and this table was built
