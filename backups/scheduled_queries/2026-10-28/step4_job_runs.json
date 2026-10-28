@@ -1,0 +1,41 @@
+{
+  "before_ltv": {
+    "total_customers": 362822,
+    "active_subscribers": 24513,
+    "active_sub_sum_ltv_12m": 13244756.95,
+    "active_sub_avg_ltv_12m": 540.32,
+    "active_sub_sum_efv_12m": 5822257.77,
+    "sum_realised_value": 23906407.73,
+    "sum_total_spend_gbp": 24068142.77,
+    "built_at": "2026-10-28 05:01:09.313112+00"
+  },
+  "after_ltv": {
+    "total_customers": 362865,
+    "active_subscribers": 24632,
+    "active_sub_sum_ltv_12m": 13274336.56,
+    "active_sub_avg_ltv_12m": 538.91,
+    "active_sub_sum_efv_12m": 5831439.81,
+    "sum_realised_value": 23906407.73,
+    "sum_total_spend_gbp": 24068142.77,
+    "built_at": "2026-10-28 06:00:19.793846+00"
+  },
+  "nightly_job": {
+    "config_name": "projects/613976204637/locations/europe-west2/transferConfigs/6abf66d9-0000-2436-a7b2-14c14ef3c450",
+    "display_name": "rh_curated nightly build + tests",
+    "backup_sql": "backups/scheduled_queries/2026-10-28/nightly_build_and_test_pre_step4_20261028_054838Z.sql",
+    "backup_json": "backups/scheduled_queries/2026-10-28/nightly_build_and_test_pre_step4_20261028_054838Z.json",
+    "run_name": "projects/613976204637/locations/europe-west2/transferConfigs/6abf66d9-0000-2436-a7b2-14c14ef3c450/runs/6ae2a6f4-0000-251e-a6d6-d43a2cfc283f",
+    "state": "SUCCEEDED",
+    "elapsed_seconds": 677
+  },
+  "ltv_job": {
+    "config_name": "projects/613976204637/locations/europe-west2/transferConfigs/6ae09451-0000-271c-b631-34c7e9450713",
+    "display_name": "customer_ltv_horizons nightly",
+    "backup_sql": "backups/scheduled_queries/2026-10-28/customer_ltv_horizons_pre_step4_20261028_060006Z.sql",
+    "backup_json": "backups/scheduled_queries/2026-10-28/customer_ltv_horizons_pre_step4_20261028_060006Z.json",
+    "run_name": "projects/613976204637/locations/europe-west2/transferConfigs/6ae09451-0000-271c-b631-34c7e9450713/runs/6ae1f3e5-0000-200e-9f0a-fc4116908041",
+    "state": "SUCCEEDED",
+    "elapsed_seconds": 77,
+    "dry_run_bytes": 105839807
+  }
+}

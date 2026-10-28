@@ -159,8 +159,42 @@ sub_pay AS (
   FROM tx WHERE NOT one_off
 ),
 fs AS (
-  SELECT subscription_key, customer_key AS customer_id, status
-  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_subscriptions`
+  SELECT
+    s.subscription_key,
+    s.customer_key AS customer_id,
+    s.status,
+    s.monthly_value_gbp,
+    IFNULL(s.is_special_offer_trial, FALSE) AS is_special_offer_trial,
+    COALESCE(
+      m.tier_band,
+      CASE
+        WHEN s.monthly_value_gbp < 20 THEN 'Low'
+        WHEN s.monthly_value_gbp < 40 THEN 'Mid'
+        WHEN s.monthly_value_gbp < 60 THEN 'High'
+        ELSE 'Very High'
+      END
+    ) AS tier_band
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_subscriptions` s
+  LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_subscription_model` m
+    ON s.subscription_model_key = m.subscription_model_key
+),
+-- Trailing mature 1st-payment conversion rate by tier from rpt_trial_conversion
+-- (fallback to overall mature 1st-payment rate when a tier has < 30 trials).
+-- Later churn is already in the subscriber survival curve, so the 3rd-payment rate is not used here.
+trial_cvr_tier AS (
+  SELECT
+    tier_band,
+    MAX(trailing_mature_trials_1st) AS trailing_mature_trials_1st,
+    MAX(trailing_tier_cvr_1st) AS trailing_tier_cvr_1st,
+    MAX(trailing_overall_cvr_1st) AS trailing_overall_cvr_1st,
+    MAX(trailing_conversion_rate_1st) AS trailing_conversion_rate_1st
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`
+  GROUP BY tier_band
+),
+trial_cvr_fallback AS (
+  SELECT
+    MAX(trailing_overall_cvr_1st) AS overall_cvr_1st
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`
 ),
 -- tenure per customer (as subscriber_tenure_detail)
 cust_modal AS (
@@ -202,22 +236,64 @@ survival_curve AS (
     LEFT JOIN raw_hazard h ON h.curve_tier = f.curve_tier AND h.month = f.month
   )
 ),
--- per subscription (as subscriber_ltv_output, excluding unpaid special-offer trials)
+-- per subscription: paid subscriptions + active genuine free trials (status = 'active' in vw_trial_status,
+-- exploit accounts with >= 10 trial subscriptions excluded; backstop: '66d231300ff155003e747fcc',
+-- '69dfaa9740447116ffe02052', '67e8bfdb8b1def003ebee6e0', '6911fdcc76ae9a44158d1022',
+-- '64b5d23f79c5fe003eefd800').
 sub_modal AS (
   SELECT subscription_key, tier, avg_amt AS monthly_value FROM (
     SELECT subscription_key, tier, AVG(amt) AS avg_amt,
       ROW_NUMBER() OVER (PARTITION BY subscription_key ORDER BY COUNT(*) DESC) AS rn
     FROM sub_pay GROUP BY 1, 2) WHERE rn = 1
 ),
+paid_subs AS (
+  SELECT subscription_key, ANY_VALUE(customer_id) AS customer_id, COUNT(*) AS current_tenure_month, SUM(amt) AS realised_value
+  FROM sub_pay GROUP BY 1
+),
 subs AS (
   SELECT a.subscription_key AS subscription_id, a.customer_id,
-    IF(m.tier = 'Very High', 'High', m.tier) AS tier, f.status, m.monthly_value,
-    a.current_tenure_month, a.realised_value, sc.survival_probability AS current_survival_probability
-  FROM (SELECT subscription_key, ANY_VALUE(customer_id) AS customer_id, COUNT(*) AS current_tenure_month, SUM(amt) AS realised_value
-        FROM sub_pay GROUP BY 1) a
+    IF(m.tier = 'Very High', 'High', m.tier) AS tier, f.status, CAST(m.monthly_value AS FLOAT64) AS monthly_value,
+    a.current_tenure_month, CAST(a.realised_value AS FLOAT64) AS realised_value,
+    sc.survival_probability AS current_survival_probability,
+    1.0 AS value_multiplier
+  FROM paid_subs a
   JOIN sub_modal m USING (subscription_key)
   JOIN fs f USING (subscription_key)
   LEFT JOIN survival_curve sc ON sc.tier = IF(m.tier = 'Very High', 'High', m.tier) AND sc.month = LEAST(a.current_tenure_month, 120)
+
+  UNION ALL
+
+  SELECT
+    ts.subscription_key AS subscription_id,
+    ts.customer_key AS customer_id,
+    IF(ts.tier_band = 'Very High', 'High', ts.tier_band) AS tier,
+    'ACTIVE' AS status,
+    CAST(COALESCE(ts.monthly_value_gbp, 15) AS FLOAT64) AS monthly_value,
+    0 AS current_tenure_month,
+    0.0 AS realised_value,
+    sc.survival_probability AS current_survival_probability,
+    CAST(
+      COALESCE(
+        IF(tct.trailing_mature_trials_1st >= 30, tct.trailing_tier_cvr_1st, tct.trailing_overall_cvr_1st),
+        tcf.overall_cvr_1st
+      ) AS FLOAT64
+    ) AS value_multiplier
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_trial_status` ts
+  LEFT JOIN paid_subs ps ON ts.subscription_key = ps.subscription_key
+  LEFT JOIN trial_cvr_tier tct ON ts.tier_band = tct.tier_band
+  CROSS JOIN trial_cvr_fallback tcf
+  LEFT JOIN survival_curve sc
+    ON sc.tier = IF(ts.tier_band = 'Very High', 'High', ts.tier_band)
+   AND sc.month = 0
+  WHERE ts.status = 'active'
+    AND ps.subscription_key IS NULL
+    AND ts.customer_key NOT IN (
+      '66d231300ff155003e747fcc',
+      '69dfaa9740447116ffe02052',
+      '67e8bfdb8b1def003ebee6e0',
+      '6911fdcc76ae9a44158d1022',
+      '64b5d23f79c5fe003eefd800'
+    )
 ),
 sub_future AS (
   SELECT s.subscription_id, h, m
@@ -227,7 +303,7 @@ sub_future AS (
 ),
 sub_efv_h AS (
   SELECT sf.subscription_id, sf.h,
-    SUM(SAFE_DIVIDE(c.survival_probability, s.current_survival_probability) * s.monthly_value) AS efv
+    SUM(SAFE_DIVIDE(c.survival_probability, s.current_survival_probability) * s.monthly_value * s.value_multiplier) AS efv
   FROM sub_future sf
   JOIN subs s USING (subscription_id)
   JOIN survival_curve c
@@ -264,7 +340,9 @@ active_sub_tier AS (
         ORDER BY s.monthly_value_gbp DESC, s.created_at DESC, s.subscription_key
       ) AS rn
     FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_subscriptions` s
-    WHERE s.status = 'ACTIVE'
+    LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.vw_trial_status` ts
+      ON s.subscription_key = ts.subscription_key
+    WHERE s.status = 'ACTIVE' OR ts.status = 'active'
   )
   WHERE rn = 1
 ),
