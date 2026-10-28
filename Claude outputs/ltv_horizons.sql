@@ -159,33 +159,8 @@ sub_pay AS (
   FROM tx WHERE NOT one_off
 ),
 fs AS (
-  SELECT
-    s.subscription_key,
-    s.customer_key AS customer_id,
-    s.status,
-    s.is_special_offer_trial,
-    s.monthly_value_gbp,
-    CASE
-      WHEN s.monthly_value_gbp < 20 THEN 'Low'
-      WHEN s.monthly_value_gbp < 40 THEN 'Mid'
-      WHEN s.monthly_value_gbp < 60 THEN 'High'
-      ELSE 'Very High'
-    END AS tier_band
-  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_subscriptions` s
-),
-trial_cvr_tier AS (
-  SELECT
-    tier_band,
-    MAX(trailing_90d_trials) AS trailing_90d_trials,
-    MAX(trailing_90d_tier_cvr) AS trailing_90d_tier_cvr,
-    MAX(trailing_90d_overall_cvr) AS trailing_90d_overall_cvr
-  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`
-  GROUP BY tier_band
-),
-trial_cvr_fallback AS (
-  SELECT
-    MAX(trailing_90d_overall_cvr) AS overall_90d_cvr
-  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`
+  SELECT subscription_key, customer_key AS customer_id, status
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_subscriptions`
 ),
 -- tenure per customer (as subscriber_tenure_detail)
 cust_modal AS (
@@ -227,56 +202,22 @@ survival_curve AS (
     LEFT JOIN raw_hazard h ON h.curve_tier = f.curve_tier AND h.month = f.month
   )
 ),
--- per subscription (as subscriber_ltv_output, with trailing 90-day trial conversion rate by tier from rpt_trial_conversion and <30 trials fallback to overall rate)
+-- per subscription (as subscriber_ltv_output, excluding unpaid special-offer trials)
 sub_modal AS (
   SELECT subscription_key, tier, avg_amt AS monthly_value FROM (
     SELECT subscription_key, tier, AVG(amt) AS avg_amt,
       ROW_NUMBER() OVER (PARTITION BY subscription_key ORDER BY COUNT(*) DESC) AS rn
     FROM sub_pay GROUP BY 1, 2) WHERE rn = 1
 ),
-paid_subs AS (
-  SELECT subscription_key, ANY_VALUE(customer_id) AS customer_id, COUNT(*) AS current_tenure_month, SUM(amt) AS realised_value
-  FROM sub_pay GROUP BY 1
-),
 subs AS (
   SELECT a.subscription_key AS subscription_id, a.customer_id,
-    IF(m.tier = 'Very High', 'High', m.tier) AS tier, f.status, CAST(m.monthly_value AS FLOAT64) AS monthly_value,
-    a.current_tenure_month, CAST(a.realised_value AS FLOAT64) AS realised_value,
-    sc.survival_probability AS current_survival_probability,
-    1.0 AS value_multiplier
-  FROM paid_subs a
+    IF(m.tier = 'Very High', 'High', m.tier) AS tier, f.status, m.monthly_value,
+    a.current_tenure_month, a.realised_value, sc.survival_probability AS current_survival_probability
+  FROM (SELECT subscription_key, ANY_VALUE(customer_id) AS customer_id, COUNT(*) AS current_tenure_month, SUM(amt) AS realised_value
+        FROM sub_pay GROUP BY 1) a
   JOIN sub_modal m USING (subscription_key)
   JOIN fs f USING (subscription_key)
   LEFT JOIN survival_curve sc ON sc.tier = IF(m.tier = 'Very High', 'High', m.tier) AND sc.month = LEAST(a.current_tenure_month, 120)
-
-  UNION ALL
-
-  SELECT
-    f.subscription_key AS subscription_id,
-    f.customer_id,
-    IF(f.tier_band = 'Very High', 'High', f.tier_band) AS tier,
-    f.status,
-    CAST(COALESCE(f.monthly_value_gbp, 15) AS FLOAT64) AS monthly_value,
-    0 AS current_tenure_month,
-    0.0 AS realised_value,
-    sc.survival_probability AS current_survival_probability,
-    CAST(
-      COALESCE(
-        IF(tct.trailing_90d_trials >= 30, tct.trailing_90d_tier_cvr, tct.trailing_90d_overall_cvr),
-        tcf.overall_90d_cvr,
-        0.10
-      ) AS FLOAT64
-    ) AS value_multiplier
-  FROM fs f
-  LEFT JOIN paid_subs ps USING (subscription_key)
-  LEFT JOIN trial_cvr_tier tct ON f.tier_band = tct.tier_band
-  CROSS JOIN trial_cvr_fallback tcf
-  LEFT JOIN survival_curve sc
-    ON sc.tier = IF(f.tier_band = 'Very High', 'High', f.tier_band)
-   AND sc.month = 0
-  WHERE f.is_special_offer_trial
-    AND f.status = 'ACTIVE'
-    AND ps.subscription_key IS NULL
 ),
 sub_future AS (
   SELECT s.subscription_id, h, m
@@ -286,7 +227,7 @@ sub_future AS (
 ),
 sub_efv_h AS (
   SELECT sf.subscription_id, sf.h,
-    SUM(SAFE_DIVIDE(c.survival_probability, s.current_survival_probability) * s.monthly_value * s.value_multiplier) AS efv
+    SUM(SAFE_DIVIDE(c.survival_probability, s.current_survival_probability) * s.monthly_value) AS efv
   FROM sub_future sf
   JOIN subs s USING (subscription_id)
   JOIN survival_curve c

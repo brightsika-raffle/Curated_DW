@@ -1,0 +1,34 @@
+{
+  "before_revert": {
+    "label": "BEFORE REVERT (with Step 4 dynamic 39.7% trial CVR)",
+    "total_customers": 362856,
+    "active_subscribers": 24611,
+    "active_sub_sum_ltv_12m": 13269043.78,
+    "active_sub_avg_ltv_12m": 539.15,
+    "active_sub_med_ltv_12m": 324.57,
+    "active_sub_sum_sub_efv_12m": 5827829.7,
+    "active_sub_avg_sub_efv_12m": 236.8,
+    "active_sub_med_sub_efv_12m": 105.8,
+    "sum_realised_value": 23906407.73,
+    "sum_total_spend_gbp": 24068142.77,
+    "built_at": "2026-10-28 04:00:11.246792+00:00"
+  },
+  "after_revert": {
+    "label": "AFTER REVERT (restored to pre-Step-4 version)",
+    "total_customers": 362822,
+    "active_subscribers": 24513,
+    "active_sub_sum_ltv_12m": 13244756.95,
+    "active_sub_avg_ltv_12m": 540.32,
+    "active_sub_med_ltv_12m": 325.48,
+    "active_sub_sum_sub_efv_12m": 5822257.77,
+    "active_sub_avg_sub_efv_12m": 237.52,
+    "active_sub_med_sub_efv_12m": 105.8,
+    "sum_realised_value": 23906407.73,
+    "sum_total_spend_gbp": 24068142.77,
+    "built_at": "2026-10-28 05:01:09.313112+00:00"
+  },
+  "backup_sql": "backups/scheduled_queries/2026-10-28/customer_ltv_horizons_pre_revert_20261028_050106Z.sql",
+  "backup_cfg": "backups/scheduled_queries/2026-10-28/customer_ltv_horizons_pre_revert_20261028_050106Z.json",
+  "run_name": "projects/613976204637/locations/europe-west2/transferConfigs/6ae09451-0000-271c-b631-34c7e9450713/runs/6ae2850e-0000-251e-a6d6-d43a2cfc283f",
+  "run_state": "SUCCEEDED"
+}
