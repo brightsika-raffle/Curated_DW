@@ -1,0 +1,37 @@
+{
+  "displayName": "RH pipeline: scheduled query failed",
+  "documentation": {
+    "content": "A BigQuery scheduled query failed. Check the transfer run log in rh-ga4-491819 (europe-west2) and the nightly test results table.",
+    "mimeType": "text/markdown"
+  },
+  "userLabels": {
+    "environment": "production",
+    "component": "data-pipeline"
+  },
+  "conditions": [
+    {
+      "displayName": "BigQuery Data Transfer Run Failed",
+      "conditionThreshold": {
+        "filter": "resource.type = \"bigquery_dts_config\" AND metric.type = \"bigquerydatatransfer.googleapis.com/transfer_config/completed_runs\" AND metric.labels.completion_state = \"FAILED\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_DELTA",
+            "crossSeriesReducer": "REDUCE_COUNT"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "trigger": {
+          "count": 1
+        }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "86400s"
+  },
+  "combiner": "OR",
+  "enabled": true
+}

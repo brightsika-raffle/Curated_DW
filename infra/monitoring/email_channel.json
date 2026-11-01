@@ -1,0 +1,9 @@
+{
+  "type": "email",
+  "displayName": "bright@raffle-house.com",
+  "description": "Alert notification channel for Raffle House pipeline failures",
+  "labels": {
+    "email_address": "bright@raffle-house.com"
+  },
+  "enabled": true
+}
