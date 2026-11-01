@@ -2533,7 +2533,8 @@ SELECT
   DATE_DIFF(DATE(s.next_purchase_date), CURRENT_DATE('Europe/London'), DAY) AS days_left,
   CASE
     WHEN COALESCE(tx.paid_payments, 0) >= 1 THEN 'converted'
-    WHEN CURRENT_DATE('Europe/London') < DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at), MONTH), INTERVAL 1 MONTH) THEN 'active'
+    WHEN DATE(s.next_purchase_date) > CURRENT_DATE('Europe/London') THEN 'active'
+    WHEN DATE(s.next_purchase_date) BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY) AND CURRENT_DATE('Europe/London') THEN 'payment due'
     ELSE 'lapsed'
   END AS status,
   tx.paid_dates[SAFE_OFFSET(0)] AS converted_date,
