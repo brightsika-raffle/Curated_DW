@@ -2408,8 +2408,8 @@ cohort_tier_agg AS (
     COUNTIF(t.converted_3rd) AS converted_3rd,
     ROUND(CAST(SAFE_DIVIDE(COUNTIF(t.converted_3rd), COUNT(*)) AS NUMERIC), 4) AS conversion_rate_3rd,
     ROUND(CAST(AVG(t.days_to_3rd) AS NUMERIC), 2) AS mean_days_3rd,
-    CURRENT_DATE('Europe/London') >= DATE_ADD(t.cohort, INTERVAL 1 MONTH) AS mature_1st,
-    CURRENT_DATE('Europe/London') >= DATE_ADD(t.cohort, INTERVAL 3 MONTH) AS mature_3rd
+    CURRENT_DATE('Europe/London') >= DATE_ADD(DATE_ADD(t.cohort, INTERVAL 1 MONTH), INTERVAL 15 DAY) AS mature_1st,
+    CURRENT_DATE('Europe/London') >= DATE_ADD(DATE_ADD(t.cohort, INTERVAL 3 MONTH), INTERVAL 15 DAY) AS mature_3rd
   FROM trials t
   GROUP BY t.cohort, t.tier
 ),
@@ -2940,6 +2940,8 @@ trial_conversion_quality AS (
   SELECT
     (SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(cohort AS STRING), '|', tier))
      FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`) AS dup_rows,
+    (SELECT COUNTIF((mature_1st AND trials > 20 AND converted_1st = 0) OR (mature_3rd AND trials > 20 AND converted_3rd = 0))
+     FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`) AS mature_zero_conv_anomalies,
     wf.all_special_offer,
     wf.sum_buckets,
     wf.waterfall_diff,
@@ -3135,6 +3137,9 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_early_warning_spike', 'WARN
                   'GA4 visits jumped without orders; possible tracking change',
                   CONCAT('Yesterday GA4 visits/orders ratio (', CAST(divergence_ratio AS STRING), ') in line with 4-week weekday median'))
 FROM early_warning_tracking
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'trial_mature_cohort_conversions', 'HARD',
+               IF(mature_zero_conv_anomalies = 0, 'PASS', 'FAIL'), 0, mature_zero_conv_anomalies,
+               'Zero mature trial cohorts with > 20 trials have 0 conversions' FROM trial_conversion_quality
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'trial_conversion_no_duplicates', 'HARD',
                IF(dup_rows = 0, 'PASS', 'FAIL'), 0, dup_rows,
                'Zero duplicate (cohort, tier) rows in rpt_trial_conversion' FROM trial_conversion_quality
@@ -3166,13 +3171,26 @@ SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.dq_gate_results`;
 
 -- Cross-suite health monitoring view
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_report_suite_health`
-OPTIONS (description = "Cross-suite health and data freshness monitoring view for all 6 Raffle House reporting areas.")
+OPTIONS (description = "Cross-suite health and data freshness monitoring view for all 6 Raffle House reporting areas. Fails if any mature trial cohort has 0 conversions.")
 AS
 WITH trial_counts AS (
   SELECT
     COUNTIF(status = 'payment due') AS payment_due_count,
     COUNTIF(status = 'active') AS active_count
   FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_trial_status`
+),
+trial_mature_test AS (
+  SELECT
+    COUNTIF((mature_1st AND trials > 20 AND converted_1st = 0) OR (mature_3rd AND trials > 20 AND converted_3rd = 0)) AS anomaly_count,
+    STRING_AGG(
+      IF(
+        (mature_1st AND trials > 20 AND converted_1st = 0) OR (mature_3rd AND trials > 20 AND converted_3rd = 0),
+        CONCAT(CAST(cohort AS STRING), ' (', tier, ')'),
+        NULL
+      ),
+      ', '
+    ) AS failed_cohorts
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`
 ),
 base_reports AS (
   -- 1. Paid Media (Meta & Google only)
@@ -3181,6 +3199,7 @@ base_reports AS (
     'rpt_paid_media_entity_daily, rpt_paid_media_entity_status' AS tables_read,
     built_at,
     COALESCE((SELECT MAX(d) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`), wh_to) AS latest_data_date,
+    FALSE AS is_failed,
     ARRAY_LENGTH(stale_feeds) > 0 AS has_caveat,
     IF(
       ARRAY_LENGTH(stale_feeds) > 0,
@@ -3197,6 +3216,7 @@ base_reports AS (
     'rpt_organic_social_weekly, rpt_organic_social_status' AS tables_read,
     built_at,
     site_data_to AS latest_data_date,
+    FALSE AS is_failed,
     NOT meta_connected AS has_caveat,
     IF(
       NOT meta_connected,
@@ -3207,18 +3227,24 @@ base_reports AS (
 
   UNION ALL
 
-  -- 3. Free Trials (renewal-day grace window dynamic counts)
+  -- 3. Free Trials (renewal-day grace window dynamic counts & mature cohort zero-conversion HARD test)
   SELECT
     'Free trials' AS report,
     'vw_trial_status, rpt_trial_conversion' AS tables_read,
     MAX(t.built_at) AS built_at,
     (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`) AS latest_data_date,
+    MAX(m.anomaly_count) > 0 AS is_failed,
     FALSE AS has_caveat,
-    CONCAT('Fresh (renewal-day grace window active: ',
-      CAST(MAX(c.payment_due_count) AS STRING), ' payment due, ',
-      CAST(MAX(c.active_count) AS STRING), ' active)') AS caveat_reason
+    IF(
+      MAX(m.anomaly_count) > 0,
+      CONCAT('HARD test failed: mature cohort has 0 conversions with >20 trials in ', MAX(m.failed_cohorts)),
+      CONCAT('Fresh (renewal-day grace window active: ',
+        CAST(MAX(c.payment_due_count) AS STRING), ' payment due, ',
+        CAST(MAX(c.active_count) AS STRING), ' active)')
+    ) AS caveat_reason
   FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion` t
   CROSS JOIN trial_counts c
+  CROSS JOIN trial_mature_test m
 
   UNION ALL
 
@@ -3228,6 +3254,7 @@ base_reports AS (
     'customer_ltv_horizons' AS tables_read,
     MAX(built_at) AS built_at,
     MAX(as_of_date) AS latest_data_date,
+    FALSE AS is_failed,
     FALSE AS has_caveat,
     'Fresh (horizons model updated nightly)' AS caveat_reason
   FROM `rh-ga4-491819.rh_curated_Bright_Test.customer_ltv_horizons`
@@ -3240,6 +3267,7 @@ base_reports AS (
     'rpt_tracking_coverage_daily' AS tables_read,
     MAX(built_at) AS built_at,
     MAX(d) AS latest_data_date,
+    FALSE AS is_failed,
     FALSE AS has_caveat,
     'Fresh (daily coverage and consent tracking)' AS caveat_reason
   FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
@@ -3252,6 +3280,7 @@ base_reports AS (
     'rpt_charity_sales_daily' AS tables_read,
     MAX(loaded_at) AS built_at,
     MAX(date) AS latest_data_date,
+    FALSE AS is_failed,
     FALSE AS has_caveat,
     'Fresh (daily charity allocations and revenue)' AS caveat_reason
   FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_charity_sales_daily`
@@ -3263,6 +3292,7 @@ SELECT
   latest_data_date,
   ROUND(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), built_at, MINUTE) / 60.0, 1) AS hours_since_build,
   CASE
+    WHEN is_failed THEN 'failed'
     WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), built_at, HOUR) > 36
       OR (report = 'Organic social' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2)
       OR (report = 'Tracking health' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2)
@@ -3272,6 +3302,7 @@ SELECT
     ELSE 'ok'
   END AS status,
   CASE
+    WHEN is_failed THEN caveat_reason
     WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), built_at, HOUR) > 36
       THEN CONCAT('Build stale: last run ', CAST(built_at AS STRING), ' (>36h ago)')
     WHEN DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2
