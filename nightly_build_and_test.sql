@@ -1788,10 +1788,9 @@ SELECT
   ARRAY(
     SELECT feed FROM UNNEST([
       STRUCT('Meta' AS feed, d.meta_to AS feed_date),
-      STRUCT('Google' AS feed, d.google_to AS feed_date),
-      STRUCT('Affiliates' AS feed, d.affiliates_to AS feed_date)
+      STRUCT('Google' AS feed, d.google_to AS feed_date)
     ])
-    WHERE feed_date IS NOT NULL AND DATE_DIFF(CURRENT_DATE('Europe/London'), feed_date, DAY) > 3
+    WHERE feed_date IS NOT NULL AND DATE_DIFF(CURRENT_DATE('Europe/London'), feed_date, DAY) > 2
   ) AS stale_feeds,
   p99.p99_v3,
   DATE '2026-09-01' AS report_start,
