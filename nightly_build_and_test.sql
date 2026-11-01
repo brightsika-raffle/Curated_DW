@@ -3166,8 +3166,14 @@ SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.dq_gate_results`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_report_suite_health`
 OPTIONS (description = "Cross-suite health and data freshness monitoring view for all 6 Raffle House reporting areas.")
 AS
-WITH base_reports AS (
-  -- 1. Paid Media
+WITH trial_counts AS (
+  SELECT
+    COUNTIF(status = 'payment due') AS payment_due_count,
+    COUNTIF(status = 'active') AS active_count
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_trial_status`
+),
+base_reports AS (
+  -- 1. Paid Media (Meta & Google only)
   SELECT
     'Paid media' AS report,
     'rpt_paid_media_entity_daily, rpt_paid_media_entity_status' AS tables_read,
@@ -3176,14 +3182,14 @@ WITH base_reports AS (
     ARRAY_LENGTH(stale_feeds) > 0 AS has_caveat,
     IF(
       ARRAY_LENGTH(stale_feeds) > 0,
-      CONCAT('Feed warning: ', ARRAY_TO_STRING(stale_feeds, ', '), ' spend feed stale since ', CAST(affiliates_to AS STRING), '; Meta 1-day lag to ', CAST(meta_to AS STRING)),
+      CONCAT('Feed warning: ', ARRAY_TO_STRING(stale_feeds, ', '), ' spend feed >2 days behind build date'),
       'Platform feeds up to date'
     ) AS caveat_reason
   FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_status`
 
   UNION ALL
 
-  -- 2. Organic Social
+  -- 2. Organic Social (complete weeks only; GA4 site data lag up to 2 days ok)
   SELECT
     'Organic social' AS report,
     'rpt_organic_social_weekly, rpt_organic_social_status' AS tables_read,
@@ -3199,15 +3205,18 @@ WITH base_reports AS (
 
   UNION ALL
 
-  -- 3. Free Trials
+  -- 3. Free Trials (renewal-day grace window dynamic counts)
   SELECT
     'Free trials' AS report,
     'vw_trial_status, rpt_trial_conversion' AS tables_read,
-    MAX(built_at) AS built_at,
+    MAX(t.built_at) AS built_at,
     (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`) AS latest_data_date,
     FALSE AS has_caveat,
-    'Fresh (renewal-day grace period active; 144 payment due, 24 active)' AS caveat_reason
-  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion`
+    CONCAT('Fresh (renewal-day grace window active: ',
+      CAST(MAX(c.payment_due_count) AS STRING), ' payment due, ',
+      CAST(MAX(c.active_count) AS STRING), ' active)') AS caveat_reason
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_trial_conversion` t
+  CROSS JOIN trial_counts c
 
   UNION ALL
 
@@ -3223,7 +3232,7 @@ WITH base_reports AS (
 
   UNION ALL
 
-  -- 5. Tracking Health
+  -- 5. Tracking Health (GA4 daily export lag up to 2 days ok)
   SELECT
     'Tracking health' AS report,
     'rpt_tracking_coverage_daily' AS tables_read,
@@ -3253,8 +3262,9 @@ SELECT
   ROUND(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), built_at, MINUTE) / 60.0, 1) AS hours_since_build,
   CASE
     WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), built_at, HOUR) > 36
-      OR (report = 'Organic social' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 7)
-      OR (report != 'Organic social' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2)
+      OR (report = 'Organic social' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2)
+      OR (report = 'Tracking health' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2)
+      OR (report NOT IN ('Organic social', 'Tracking health') AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2)
       THEN 'stale'
     WHEN has_caveat THEN 'warning'
     ELSE 'ok'
@@ -3262,10 +3272,8 @@ SELECT
   CASE
     WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), built_at, HOUR) > 36
       THEN CONCAT('Build stale: last run ', CAST(built_at AS STRING), ' (>36h ago)')
-    WHEN report = 'Organic social' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 7
-      THEN CONCAT('Data stale: latest complete date ', CAST(latest_data_date AS STRING), ' (>7d ago)')
-    WHEN report != 'Organic social' AND DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2
-      THEN CONCAT('Data stale: latest data date ', CAST(latest_data_date AS STRING), ' (>2d ago)')
+    WHEN DATE_DIFF(CURRENT_DATE('Europe/London'), latest_data_date, DAY) > 2
+      THEN CONCAT('Data stale: latest data date ', CAST(latest_data_date AS STRING), ' (>2d behind build date)')
     WHEN has_caveat THEN caveat_reason
     ELSE caveat_reason
   END AS reason
