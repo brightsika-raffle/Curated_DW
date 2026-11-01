@@ -829,7 +829,7 @@ SELECT
   session_campaign,
   device_category,
   bt_events_that_day,
-  event_date < DATE '2026-10-24' AS ga4_reliable,
+  event_date < DATE '2026-10-19' AS ga4_reliable,
   CURRENT_TIMESTAMP() AS loaded_at
 FROM raw
 WHERE rn = 1;
@@ -1313,7 +1313,7 @@ SELECT
   COALESCE(w.new_subs, 0) AS new_subs,
   COALESCE(w.ltv3m, NUMERIC '0') AS ltv3m,
   DATE_DIFF(CURRENT_DATE('Europe/London'), COALESCE(s.d, w.d), DAY) < 7 AS maturing,
-  COALESCE(tc.ga4_sessions_reliable, COALESCE(s.d, w.d) < DATE '2026-10-24') AS ga4_reliable
+  COALESCE(tc.ga4_sessions_reliable, COALESCE(s.d, w.d) < DATE '2026-10-19') AS ga4_reliable
 FROM spend_both_bases s
 FULL OUTER JOIN wh_agg w
   ON s.d = w.d
@@ -1469,7 +1469,7 @@ SELECT
   COALESCE(l.landings, 0) AS landings,
   COALESCE(p.page_views, 0) AS page_views,
   TRUE AS ga4_complete,
-  COALESCE(l.d, p.d) < DATE '2026-10-24' AS ga4_reliable,
+  COALESCE(l.d, p.d) < DATE '2026-10-19' AS ga4_reliable,
   CURRENT_TIMESTAMP() AS built_at
 FROM landings_agg l
 FULL OUTER JOIN page_views_agg p
@@ -1655,7 +1655,11 @@ SELECT
     v.total_pv,
     SAFE_DIVIDE(v.granted_pv, v.granted_landings)
   )) AS INT64), NULL) AS est_visits,
-  dt.d < DATE '2026-10-24' AS ga4_sessions_reliable,
+  (
+    COALESCE(g.ga4_sessions, 0) > 0
+    AND SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), g.ga4_sessions) <= 0.20
+    AND (SAFE_DIVIDE(v.granted_landings, v.visit_landings) IS NULL OR SAFE_DIVIDE(v.granted_landings, v.visit_landings) >= 0.50)
+  ) AS ga4_sessions_reliable,
   COALESCE(g.ga4_sessions, 0) > 0 AS ga4_complete,
   CURRENT_TIMESTAMP() AS built_at
 FROM dates dt
@@ -2965,6 +2969,10 @@ early_warning_tracking AS (
     LIMIT 1
   ) m
 ),
+ga4_break_quality AS (
+  SELECT COUNTIF(d >= DATE '2026-10-19' AND ga4_sessions_reliable) AS true_after_break_count
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
+),
 ga4_flags AS (
   SELECT
     (SELECT COUNTIF(ga4_reliable IS NULL) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_visit_source_daily`)
@@ -3233,6 +3241,9 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_early_warning_spike', 'WARN
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'ga4_reliable_flag_populated', 'HARD',
                IF(null_flags_count = 0, 'PASS', 'FAIL'), 0, null_flags_count,
                'Every table reading GA4 has non-null ga4_reliable flag' FROM ga4_flags
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'ga4_reliable_from_break', 'HARD',
+               IF(true_after_break_count = 0, 'PASS', 'FAIL'), 0, true_after_break_count,
+               'Zero days from 2026-10-19 onwards have ga4_sessions_reliable = true' FROM ga4_break_quality
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_early_warning_incomplete_guard', 'HARD',
                IF(fixture_test_result = 'WARN', 'PASS', 'FAIL'), 0, IF(fixture_test_result = 'WARN', 0, 1),
                'Early-warning test returns WARN when ga4_complete is false (tested with incomplete fixture day)' FROM early_warning_guard
@@ -3765,13 +3776,13 @@ organic_agg AS (
   WHERE w.platform = 'Total'
 ),
 organic_rows AS (
-  SELECT CONCAT('org_clearly_sessions_', oa.period) AS kpi_id, 'organic_charity' AS section, 'Organic Social Site Sessions (Clearly Organic)' AS label, oa.period, CAST(oa.clearly_sessions AS NUMERIC) AS value, 'count' AS unit, oa.as_of_date, 'rpt_organic_social_weekly' AS source_tables, oa.built_at, oa.health_organic AS health_status, 'GA4 sessions unreliable since 2026-10-24; site CVR understated' AS note FROM organic_agg oa
+  SELECT CONCAT('org_clearly_sessions_', oa.period) AS kpi_id, 'organic_charity' AS section, 'Organic Social Site Sessions (Clearly Organic)' AS label, oa.period, CAST(oa.clearly_sessions AS NUMERIC) AS value, 'count' AS unit, oa.as_of_date, 'rpt_organic_social_weekly' AS source_tables, oa.built_at, oa.health_organic AS health_status, 'GA4 sessions unreliable since 2026-10-19; site CVR understated' AS note FROM organic_agg oa
   UNION ALL
   SELECT CONCAT('org_clearly_purchases_', oa.period), 'organic_charity', 'Organic Social Purchases (Clearly Organic)', oa.period, CAST(oa.clearly_purchases AS NUMERIC), 'count', oa.as_of_date, 'rpt_organic_social_weekly', oa.built_at, oa.health_organic, 'Orders from clearly organic social sessions' FROM organic_agg oa
   UNION ALL
   SELECT CONCAT('org_clearly_revenue_', oa.period), 'organic_charity', 'Organic Social Revenue (Clearly Organic)', oa.period, CAST(oa.clearly_revenue AS NUMERIC), 'gbp', oa.as_of_date, 'rpt_organic_social_weekly', oa.built_at, oa.health_organic, 'Revenue from clearly organic social sessions' FROM organic_agg oa
   UNION ALL
-  SELECT CONCAT('org_unclear_sessions_', oa.period), 'organic_charity', 'Organic Social Site Sessions (Unclear)', oa.period, CAST(oa.unclear_sessions AS NUMERIC), 'count', oa.as_of_date, 'rpt_organic_social_weekly', oa.built_at, oa.health_organic, 'GA4 sessions unreliable since 2026-10-24; site CVR understated' AS note FROM organic_agg oa
+  SELECT CONCAT('org_unclear_sessions_', oa.period), 'organic_charity', 'Organic Social Site Sessions (Unclear)', oa.period, CAST(oa.unclear_sessions AS NUMERIC), 'count', oa.as_of_date, 'rpt_organic_social_weekly', oa.built_at, oa.health_organic, 'GA4 sessions unreliable since 2026-10-19; site CVR understated' AS note FROM organic_agg oa
   UNION ALL
   SELECT CONCAT('org_unclear_purchases_', oa.period), 'organic_charity', 'Organic Social Purchases (Unclear)', oa.period, CAST(oa.unclear_purchases AS NUMERIC), 'count', oa.as_of_date, 'rpt_organic_social_weekly', oa.built_at, oa.health_organic, 'Orders from unclear social sessions' FROM organic_agg oa
   UNION ALL
