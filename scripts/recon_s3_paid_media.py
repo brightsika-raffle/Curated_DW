@@ -50,8 +50,7 @@ GROUP BY 1
 for r in client.query(q_aff).result():
     print(dict(r))
 print("Root Cause: Affiliates spend is not connected via an automated API connector. It relies entirely on a manual CSV upload / Google Sheets ingestion into rh_warehouse. The last manual upload batch stopped at 2026-09-27.")
-print("Feed Owner: Marketing / Affiliates Team Lead.")
-print("Action Needed: The Affiliates lead needs to provide a fresh CSV export covering 2026-09-28 to date, or connect the affiliate network report (e.g. Awin / CJ) via a scheduled Google Sheet / Cloud Storage sync.")
+print("Feed Status: Affiliates spend is out of scope for paid media reporting; manual upload stopped at 2026-09-27.")
 
 print("\n" + "=" * 80)
 print("S3.b META SPEND 1-DAY LAG EXPLANATION")
@@ -66,7 +65,7 @@ FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`
 """
 for r in client.query(q_meta).result():
     print(dict(r))
-print("Root Cause: Meta Insights API reporting settlement lag. The Cloud Run ingestion job (`meta-daily-sync`) runs overnight and queries the Meta Graph API for finalized days. Meta API metrics for yesterday (31 Oct) finalize with a 24-48 hour settlement window, so 30 Oct is the latest finalized date available at morning build time. This 1-day lag is expected behavior for Meta ad reporting.")
+print("Meta Load Mechanism: Scheduler and job name are unknown (Cloud Run and Cloud Scheduler list permissions are denied on the service account). Factual evidence from BigQuery: stg_meta_ads_daily was last updated at 2026-10-31 21:00:47 UTC with spend data through 2026-10-30. Meta API reporting metrics settle with a 24-48 hour window, so a 1-day lag at morning build time is expected behavior.")
 
 print("\n" + "=" * 80)
 print("S3.c UPDATED rpt_paid_media_entity_status (with stale_feeds)")
