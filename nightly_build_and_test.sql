@@ -1478,10 +1478,14 @@ PARTITION BY week_commencing
 CLUSTER BY platform
 OPTIONS (description = "Weekly organic social performance aggregation by platform and Total for complete weeks (Mon-Sun).")
 AS
-WITH platform_rollup AS (
+WITH max_site_date AS (
+  SELECT MAX(date) AS site_data_to
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`
+),
+platform_rollup AS (
   SELECT
-    DATE_TRUNC(date, WEEK(MONDAY)) AS week_commencing,
-    platform,
+    DATE_TRUNC(s.date, WEEK(MONDAY)) AS week_commencing,
+    s.platform,
     CAST(NULL AS INT64) AS followers_start,
     CAST(NULL AS INT64) AS followers_end,
     CAST(NULL AS INT64) AS follower_change,
@@ -1495,16 +1499,17 @@ WITH platform_rollup AS (
     CAST(NULL AS NUMERIC) AS mean_engagement_rate_per_post,
     CAST(NULL AS NUMERIC) AS median_engagement_rate_per_post,
     CAST(NULL AS BOOL) AS has_outlier_post,
-    SUM(CASE WHEN traffic_category = 'clearly_organic' THEN sessions ELSE 0 END) AS site_sessions,
-    SUM(CASE WHEN traffic_category = 'clearly_organic' THEN purchases ELSE 0 END) AS site_purchases,
-    ROUND(SUM(CASE WHEN traffic_category = 'clearly_organic' THEN revenue ELSE 0 END), 2) AS site_revenue,
-    SUM(CASE WHEN traffic_category = 'clearly_organic' THEN new_customers ELSE 0 END) AS site_new_customers,
-    SUM(CASE WHEN traffic_category = 'unclear' THEN sessions ELSE 0 END) AS site_sessions_unclear,
-    SUM(CASE WHEN traffic_category = 'unclear' THEN purchases ELSE 0 END) AS site_purchases_unclear,
-    ROUND(SUM(CASE WHEN traffic_category = 'unclear' THEN revenue ELSE 0 END), 2) AS site_revenue_unclear,
-    SUM(CASE WHEN traffic_category = 'unclear' THEN new_customers ELSE 0 END) AS site_new_customers_unclear
-  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`
-  WHERE DATE_ADD(DATE_TRUNC(date, WEEK(MONDAY)), INTERVAL 6 DAY) <= CURRENT_DATE('Europe/London')
+    SUM(CASE WHEN s.traffic_category = 'clearly_organic' THEN s.sessions ELSE 0 END) AS site_sessions,
+    SUM(CASE WHEN s.traffic_category = 'clearly_organic' THEN s.purchases ELSE 0 END) AS site_purchases,
+    ROUND(SUM(CASE WHEN s.traffic_category = 'clearly_organic' THEN s.revenue ELSE 0 END), 2) AS site_revenue,
+    SUM(CASE WHEN s.traffic_category = 'clearly_organic' THEN s.new_customers ELSE 0 END) AS site_new_customers,
+    SUM(CASE WHEN s.traffic_category = 'unclear' THEN s.sessions ELSE 0 END) AS site_sessions_unclear,
+    SUM(CASE WHEN s.traffic_category = 'unclear' THEN s.purchases ELSE 0 END) AS site_purchases_unclear,
+    ROUND(SUM(CASE WHEN s.traffic_category = 'unclear' THEN s.revenue ELSE 0 END), 2) AS site_revenue_unclear,
+    SUM(CASE WHEN s.traffic_category = 'unclear' THEN s.new_customers ELSE 0 END) AS site_new_customers_unclear
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily` s
+  CROSS JOIN max_site_date m
+  WHERE DATE_ADD(DATE_TRUNC(s.date, WEEK(MONDAY)), INTERVAL 6 DAY) <= m.site_data_to
   GROUP BY 1, 2
 ),
 total_rollup AS (
