@@ -1334,21 +1334,6 @@ SELECT
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'bing' OR channel_group IN ('Microsoft Ads', 'Bing')) AS bing_to,
   (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE channel_group = 'Affiliates') AS affiliates_to;
 
-CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_status`
-OPTIONS (description = "One-row status table for organic social reporting page showing sync and break dates.")
-AS
-SELECT
-  CURRENT_TIMESTAMP() AS built_at,
-  DATE '2026-10-19' AS tracking_changed_on,
-  DATE '2026-10-19' AS cookie_banner_changed_on,
-  DATE '2026-10-24' AS consent_setting_changed_on,
-  DATE '2026-10-26' AS pricing_display_changed_on,
-  [DATE '2026-10-19', DATE '2026-10-24', DATE '2026-10-26'] AS change_dates,
-  FALSE AS meta_connected,
-  CAST(NULL AS DATE) AS ig_data_to,
-  CAST(NULL AS DATE) AS fb_data_to,
-  (SELECT MAX(date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`) AS site_data_to;
-
 -- =====================================================================
 -- SECTION 14 — rpt_visit_source_daily  (reloads last 3 days from finalized events_YYYYMMDD tables)
 -- =====================================================================
@@ -1482,6 +1467,110 @@ FULL OUTER JOIN page_views_agg p
  AND l.channel = p.channel
  AND (l.source = p.source OR (l.source IS NULL AND p.source IS NULL))
  AND (l.medium = p.medium OR (l.medium IS NULL AND p.medium IS NULL));
+
+-- =====================================================================
+-- SECTION 14B — ORGANIC SOCIAL REPORTING TABLES
+-- rpt_organic_social_weekly, rpt_organic_social_top_posts, rpt_organic_social_status
+-- Rebuilt nightly after GA4 visit source steps
+-- =====================================================================
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_weekly`
+PARTITION BY week_commencing
+CLUSTER BY platform
+OPTIONS (description = "Weekly organic social performance aggregation by platform and Total for complete weeks (Mon-Sun).")
+AS
+WITH platform_rollup AS (
+  SELECT
+    DATE_TRUNC(date, WEEK(MONDAY)) AS week_commencing,
+    platform,
+    CAST(NULL AS INT64) AS followers_start,
+    CAST(NULL AS INT64) AS followers_end,
+    CAST(NULL AS INT64) AS follower_change,
+    CAST(NULL AS INT64) AS reach,
+    CAST(NULL AS INT64) AS total_engagements,
+    CAST(NULL AS NUMERIC) AS engagement_rate,
+    CAST(NULL AS INT64) AS posts_published,
+    CAST(NULL AS STRING) AS posts_by_type,
+    CAST(NULL AS NUMERIC) AS mean_reach_per_post,
+    CAST(NULL AS NUMERIC) AS median_reach_per_post,
+    CAST(NULL AS NUMERIC) AS mean_engagement_rate_per_post,
+    CAST(NULL AS NUMERIC) AS median_engagement_rate_per_post,
+    CAST(NULL AS BOOL) AS has_outlier_post,
+    SUM(CASE WHEN traffic_category = 'clearly_organic' THEN sessions ELSE 0 END) AS site_sessions,
+    SUM(CASE WHEN traffic_category = 'clearly_organic' THEN purchases ELSE 0 END) AS site_purchases,
+    ROUND(SUM(CASE WHEN traffic_category = 'clearly_organic' THEN revenue ELSE 0 END), 2) AS site_revenue,
+    SUM(CASE WHEN traffic_category = 'clearly_organic' THEN new_customers ELSE 0 END) AS site_new_customers,
+    SUM(CASE WHEN traffic_category = 'unclear' THEN sessions ELSE 0 END) AS site_sessions_unclear,
+    SUM(CASE WHEN traffic_category = 'unclear' THEN purchases ELSE 0 END) AS site_purchases_unclear,
+    ROUND(SUM(CASE WHEN traffic_category = 'unclear' THEN revenue ELSE 0 END), 2) AS site_revenue_unclear,
+    SUM(CASE WHEN traffic_category = 'unclear' THEN new_customers ELSE 0 END) AS site_new_customers_unclear
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`
+  WHERE DATE_ADD(DATE_TRUNC(date, WEEK(MONDAY)), INTERVAL 6 DAY) <= CURRENT_DATE('Europe/London')
+  GROUP BY 1, 2
+),
+total_rollup AS (
+  SELECT
+    week_commencing,
+    'Total' AS platform,
+    CAST(NULL AS INT64) AS followers_start,
+    CAST(NULL AS INT64) AS followers_end,
+    CAST(NULL AS INT64) AS follower_change,
+    CAST(NULL AS INT64) AS reach,
+    CAST(NULL AS INT64) AS total_engagements,
+    CAST(NULL AS NUMERIC) AS engagement_rate,
+    CAST(NULL AS INT64) AS posts_published,
+    CAST(NULL AS STRING) AS posts_by_type,
+    CAST(NULL AS NUMERIC) AS mean_reach_per_post,
+    CAST(NULL AS NUMERIC) AS median_reach_per_post,
+    CAST(NULL AS NUMERIC) AS mean_engagement_rate_per_post,
+    CAST(NULL AS NUMERIC) AS median_engagement_rate_per_post,
+    CAST(NULL AS BOOL) AS has_outlier_post,
+    SUM(site_sessions) AS site_sessions,
+    SUM(site_purchases) AS site_purchases,
+    ROUND(SUM(site_revenue), 2) AS site_revenue,
+    SUM(site_new_customers) AS site_new_customers,
+    SUM(site_sessions_unclear) AS site_sessions_unclear,
+    SUM(site_purchases_unclear) AS site_purchases_unclear,
+    ROUND(SUM(site_revenue_unclear), 2) AS site_revenue_unclear,
+    SUM(site_new_customers_unclear) AS site_new_customers_unclear
+  FROM platform_rollup
+  GROUP BY 1
+)
+SELECT * FROM platform_rollup
+UNION ALL
+SELECT * FROM total_rollup;
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_top_posts`
+(
+  week_commencing DATE,
+  platform STRING,
+  post_rank INT64,
+  post_id STRING,
+  permalink STRING,
+  post_type STRING,
+  reach INT64,
+  engagement INT64,
+  engagement_rate NUMERIC
+)
+OPTIONS (description = "Top 10 posts per week ranked by engagement rate from organic social platforms. Empty pending Meta Graph API connection.");
+
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_status`
+OPTIONS (description = "One-row status table for organic social reporting page showing sync and break dates.")
+AS
+SELECT
+  CURRENT_TIMESTAMP() AS built_at,
+  DATE '2026-10-19' AS tracking_changed_on,
+  DATE '2026-10-19' AS cookie_banner_changed_on,
+  DATE '2026-10-24' AS consent_setting_changed_on,
+  DATE '2026-10-26' AS pricing_display_changed_on,
+  [DATE '2026-10-19', DATE '2026-10-24', DATE '2026-10-26'] AS change_dates,
+  FALSE AS meta_connected,
+  CAST(NULL AS DATE) AS ig_data_to,
+  CAST(NULL AS DATE) AS fb_data_to,
+  (SELECT MAX(date) FROM `rh-ga4-491819.rh_curated_Bright_Test.vw_organic_social_sessions_daily`) AS site_data_to,
+  FALSE AS top_posts_available,
+  'Meta Graph API feed is not connected (meta_connected = false); top posts requires Meta Page and Instagram permissions.' AS top_posts_unavailable_reason,
+  CURRENT_TIMESTAMP() AS weekly_table_built_at,
+  (SELECT MAX(week_commencing) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_weekly`) AS latest_week;
 
 -- =====================================================================
 -- SECTION 15 — rpt_tracking_coverage_daily  (rebuilt nightly from 2026-09-01)
