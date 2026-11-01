@@ -2552,12 +2552,14 @@ SELECT
   ) AS tier_band,
   s.monthly_value_gbp,
   DATE_DIFF(CURRENT_DATE('Europe/London'), DATE(tx.first_free_at, 'Europe/London'), DAY) AS days_in,
-  DATE_DIFF(DATE(s.next_purchase_date), CURRENT_DATE('Europe/London'), DAY) AS days_left,
+  DATE_DIFF(DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH), CURRENT_DATE('Europe/London'), DAY) AS days_left,
   CASE
     WHEN COALESCE(tx.paid_payments, 0) >= 1 THEN 'converted'
+    WHEN s.status IN ('MONTHLY_PAYMENT_ACTION_REQUIRED', 'PAUSED', 'CANCELLED', 'MONTHLY_CANCELLED', 'MONTHLY_CANCELLED_FINISHED', 'FINISHED') THEN 'lapsed'
     WHEN CURRENT_DATE('Europe/London') < DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH) THEN 'active'
     WHEN CURRENT_DATE('Europe/London') BETWEEN DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH)
-                                           AND DATE_ADD(DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH), INTERVAL 3 DAY) THEN 'payment due'
+                                           AND DATE_ADD(DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH), INTERVAL 15 DAY)
+         AND s.status IN ('ACTIVE', 'MONTHLY_PAYMENT_FAILED') THEN 'payment due'
     ELSE 'lapsed'
   END AS status,
   tx.paid_dates[SAFE_OFFSET(0)] AS converted_date,
@@ -3539,7 +3541,7 @@ acq_ltv_agg AS (
 trials_ltv_rows AS (
   SELECT 'trials_active_count' AS kpi_id, 'trials_ltv' AS section, 'Active Trials' AS label, 'trailing' AS period, CAST(ts.active_count AS NUMERIC) AS value, 'count' AS unit, ts.as_of_date, 'vw_trial_status' AS source_tables, ts.built_at, ts.health_trials AS health_status, 'Special-offer free trials currently inside 1-month trial window before first renewal date' AS note FROM trials_status_agg ts
   UNION ALL
-  SELECT 'trials_payment_due_count', 'trials_ltv', 'Trials Payment Due', 'trailing', CAST(ts.payment_due_count AS NUMERIC), 'count', ts.as_of_date, 'vw_trial_status', ts.built_at, ts.health_trials, 'Special-offer trials in 3-day renewal grace period (first renewal date to +3 days)' FROM trials_status_agg ts
+  SELECT 'trials_payment_due_count', 'trials_ltv', 'Trials Payment Due', 'trailing', CAST(ts.payment_due_count AS NUMERIC), 'count', ts.as_of_date, 'vw_trial_status', ts.built_at, ts.health_trials, 'Special-offer trials in 15-day renewal grace period (first renewal date to +15 days, status ACTIVE or MONTHLY_PAYMENT_FAILED)' FROM trials_status_agg ts
   UNION ALL
   SELECT 'trials_conv_rate_1st_mature', 'trials_ltv', 'Trailing Mature 1st Payment CVR', 'trailing', CAST(tc.conv_rate_1st_mature_pct AS NUMERIC), 'pct', ts.as_of_date, 'rpt_trial_conversion', ts.built_at, ts.health_trials, 'Overall conversion rate to 1st paid payment across all mature trial cohorts' FROM trials_conv_agg tc CROSS JOIN trials_status_agg ts
   UNION ALL
