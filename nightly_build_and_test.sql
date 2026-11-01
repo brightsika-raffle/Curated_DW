@@ -2523,9 +2523,10 @@ SELECT
   s.subscription_key,
   s.customer_key,
   tx.first_free_at,
-  DATE(tx.first_free_at) AS start_date,
-  DATE_TRUNC(DATE(tx.first_free_at), MONTH) AS cohort,
+  DATE(tx.first_free_at, 'Europe/London') AS start_date,
+  DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH) AS cohort,
   DATE(s.next_purchase_date) AS next_purchase_date,
+  DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH) AS first_renewal_date,
   COALESCE(
     m.tier_name,
     CASE
@@ -2546,12 +2547,13 @@ SELECT
     END
   ) AS tier_band,
   s.monthly_value_gbp,
-  DATE_DIFF(CURRENT_DATE('Europe/London'), DATE(tx.first_free_at), DAY) AS days_in,
+  DATE_DIFF(CURRENT_DATE('Europe/London'), DATE(tx.first_free_at, 'Europe/London'), DAY) AS days_in,
   DATE_DIFF(DATE(s.next_purchase_date), CURRENT_DATE('Europe/London'), DAY) AS days_left,
   CASE
     WHEN COALESCE(tx.paid_payments, 0) >= 1 THEN 'converted'
-    WHEN DATE(s.next_purchase_date) > CURRENT_DATE('Europe/London') THEN 'active'
-    WHEN DATE(s.next_purchase_date) BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY) AND CURRENT_DATE('Europe/London') THEN 'payment due'
+    WHEN CURRENT_DATE('Europe/London') < DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH) THEN 'active'
+    WHEN CURRENT_DATE('Europe/London') BETWEEN DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH)
+                                           AND DATE_ADD(DATE_ADD(DATE_TRUNC(DATE(tx.first_free_at, 'Europe/London'), MONTH), INTERVAL 1 MONTH), INTERVAL 3 DAY) THEN 'payment due'
     ELSE 'lapsed'
   END AS status,
   tx.paid_dates[SAFE_OFFSET(0)] AS converted_date,
