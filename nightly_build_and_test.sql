@@ -1764,19 +1764,36 @@ p99_calc AS (
     ROUND(CAST(PERCENTILE_CONT(IF(is_first_purchase, CAST(v3_raw AS FLOAT64), NULL), 0.99) OVER () AS NUMERIC), 2) AS p99_v3
   FROM windowed_touches
   LIMIT 1
+),
+dates_calc AS (
+  SELECT
+    (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`) AS wh_to,
+    (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`) AS meta_to,
+    (SELECT MAX(segments_date) FROM `rh-ga4-491819.google_ads_transfer.ads_CampaignBasicStats_6102368044`) AS google_to,
+    CAST(NULL AS DATE) AS bing_to,
+    (SELECT MAX(`Period`) FROM `rh-ga4-491819.rh_warehouse.marketing_spend_by_channel_manual_upload` WHERE `Channel Group` = 'Affiliates') AS affiliates_to
 )
 SELECT
   CURRENT_TIMESTAMP() AS built_at,
-  (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`) AS wh_to,
-  (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily`) AS meta_to,
-  (SELECT MAX(segments_date) FROM `rh-ga4-491819.google_ads_transfer.ads_CampaignBasicStats_6102368044`) AS google_to,
-  CAST(NULL AS DATE) AS bing_to,
-  (SELECT MAX(`Period`) FROM `rh-ga4-491819.rh_warehouse.marketing_spend_by_channel_manual_upload` WHERE `Channel Group` = 'Affiliates') AS affiliates_to,
+  d.wh_to,
+  d.meta_to,
+  d.google_to,
+  d.bing_to,
+  d.affiliates_to,
+  ARRAY(
+    SELECT feed FROM UNNEST([
+      STRUCT('Meta' AS feed, d.meta_to AS feed_date),
+      STRUCT('Google' AS feed, d.google_to AS feed_date),
+      STRUCT('Affiliates' AS feed, d.affiliates_to AS feed_date)
+    ])
+    WHERE feed_date IS NOT NULL AND DATE_DIFF(CURRENT_DATE('Europe/London'), feed_date, DAY) > 3
+  ) AS stale_feeds,
   p99.p99_v3,
   DATE '2026-09-01' AS report_start,
   DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 6 DAY) AS mat_from,
   [DATE '2026-10-19', DATE '2026-10-24', DATE '2026-10-26'] AS change_dates
-FROM p99_calc p99;
+FROM p99_calc p99
+CROSS JOIN dates_calc d;
 
 CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`
 PARTITION BY d
