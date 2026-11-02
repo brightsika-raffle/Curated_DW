@@ -2970,7 +2970,7 @@ early_warning_tracking AS (
   ) m
 ),
 ga4_break_quality AS (
-  SELECT COUNTIF(d BETWEEN DATE '2026-10-19' AND DATE '2026-10-31' AND ga4_sessions_reliable) AS true_in_break_window
+  SELECT COUNTIF(d BETWEEN DATE '2026-10-19' AND DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY) AND ga4_sessions_reliable) AS true_in_break_window
   FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
 ),
 ga4_flags AS (
@@ -3243,7 +3243,7 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'ga4_reliable_flag_populated', 'HARD'
                'Every table reading GA4 has non-null ga4_reliable flag' FROM ga4_flags
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'ga4_reliable_from_break', 'HARD',
                IF(true_in_break_window = 0, 'PASS', 'FAIL'), 0, true_in_break_window,
-               'Zero days in break window (2026-10-19 to 2026-10-31) have ga4_sessions_reliable = true' FROM ga4_break_quality
+               'Zero days in break window (2026-10-19 to yesterday) have ga4_sessions_reliable = true' FROM ga4_break_quality
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'tracking_early_warning_incomplete_guard', 'HARD',
                IF(fixture_test_result = 'WARN', 'PASS', 'FAIL'), 0, IF(fixture_test_result = 'WARN', 0, 1),
                'Early-warning test returns WARN when ga4_complete is false (tested with incomplete fixture day)' FROM early_warning_guard
