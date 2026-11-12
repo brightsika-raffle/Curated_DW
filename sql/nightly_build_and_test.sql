@@ -1019,6 +1019,9 @@ CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_p
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_paid_media_entity`       AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_paid_media_entity`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_daily` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_status` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_status`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_ga4_session_funnel`
+OPTIONS (description = "Power BI view over fact_ga4_session_funnel without built_at.")
+AS SELECT * EXCEPT(built_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_session_funnel`;
 CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_meta_audience_compare_daily`
 OPTIONS (description = 'Daily Meta audience split: warehouse (Meta last touch, paid, first payment only) against Meta user_segment_key. Two buckets because engaged cannot be matched like for like yet. Rebuilt nightly.', labels = [('layer', 'report'), ('owner', 'bright_sika')])
 AS
@@ -1733,7 +1736,135 @@ SELECT
   (SELECT MAX(week_commencing) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_organic_social_weekly`) AS latest_week;
 
 -- =====================================================================
--- SECTION 15 — rpt_tracking_coverage_daily  (rebuilt nightly from 2026-09-01)
+-- SECTION 14b: fact_ga4_session_funnel (reloads last 3 days from finalized events_YYYYMMDD tables)
+-- =====================================================================
+DELETE FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_session_funnel`
+WHERE session_date BETWEEN DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY)
+                       AND DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY);
+
+INSERT INTO `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_session_funnel`
+(
+  session_date, user_pseudo_id, ga_session_id, device_category, channel,
+  source_medium_raw, has_user_id, viewed_draw, added_basket, reached_basket,
+  started_checkout, paid, entry_stage, furthest_stage, cycle_day, built_at
+)
+WITH events_extracted AS (
+  SELECT
+    event_timestamp,
+    event_name,
+    user_pseudo_id,
+    user_id,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
+    COALESCE(
+      device.category,
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'device_category'),
+      'unknown'
+    ) AS device_category,
+    collected_traffic_source.manual_source AS manual_source,
+    collected_traffic_source.manual_medium AS manual_medium,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source') AS param_source,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium') AS param_medium
+  FROM `rh-ga4-491819.analytics_354198910.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY))
+                          AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 1 DAY))
+    AND _TABLE_SUFFIX NOT LIKE 'intraday_%'
+),
+raw_sessions AS (
+  SELECT
+    user_pseudo_id,
+    ga_session_id,
+    DATE(TIMESTAMP_MICROS(MIN(event_timestamp)), 'Europe/London') AS session_date,
+    ANY_VALUE(device_category) AS device_category,
+    LOWER(CONCAT(
+      IFNULL(ANY_VALUE(manual_source), IFNULL(ANY_VALUE(param_source), '')),
+      '|',
+      IFNULL(ANY_VALUE(manual_medium), IFNULL(ANY_VALUE(param_medium), ''))
+    )) AS src,
+    LOGICAL_OR(user_id IS NOT NULL) AS has_user_id,
+    LOGICAL_OR(event_name = 'product_view') AS viewed_draw,
+    LOGICAL_OR(event_name = 'add_to_basket') AS added_basket,
+    LOGICAL_OR(event_name IN ('add_to_basket', 'basket_view')) AS reached_basket,
+    LOGICAL_OR(event_name = 'form_start') AS started_checkout,
+    LOGICAL_OR(event_name = 'BoughtTickets') AS paid,
+    ARRAY_AGG(
+      CASE 
+        WHEN event_name = 'product_view' THEN 'viewed_draw'
+        WHEN event_name IN ('add_to_basket', 'basket_view') THEN 'reached_basket'
+        WHEN event_name = 'form_start' THEN 'started_checkout'
+        WHEN event_name = 'BoughtTickets' THEN 'paid'
+        ELSE NULL
+      END IGNORE NULLS
+      ORDER BY event_timestamp ASC
+      LIMIT 1
+    )[SAFE_OFFSET(0)] AS entry_stage,
+    CASE
+      WHEN LOGICAL_OR(event_name = 'BoughtTickets') THEN 'paid'
+      WHEN LOGICAL_OR(event_name = 'form_start') THEN 'started_checkout'
+      WHEN LOGICAL_OR(event_name IN ('add_to_basket', 'basket_view')) THEN 'reached_basket'
+      WHEN LOGICAL_OR(event_name = 'product_view') THEN 'viewed_draw'
+      ELSE NULL
+    END AS furthest_stage
+  FROM events_extracted
+  WHERE ga_session_id IS NOT NULL
+  GROUP BY user_pseudo_id, ga_session_id
+),
+classified_sessions AS (
+  SELECT
+    s.session_date,
+    s.user_pseudo_id,
+    s.ga_session_id,
+    s.device_category,
+    CASE
+      WHEN REGEXP_CONTAINS(s.src, r'(cpc|ppc|paidsearch)') THEN 'Paid search'
+      WHEN REGEXP_CONTAINS(s.src, r'(paidsocial|paid_social)') THEN 'Paid social'
+      WHEN REGEXP_CONTAINS(s.src, r'(klaviyo|email|newsletter)') THEN 'Email'
+      WHEN REGEXP_CONTAINS(s.src, r'(facebook|instagram|tiktok|fb|ig|t\.co|twitter|youtube)') THEN 'Organic social'
+      WHEN REGEXP_CONTAINS(s.src, r'\|organic\|') THEN 'Organic search'
+      WHEN s.src IS NULL OR s.src = '||' OR REGEXP_CONTAINS(s.src, r'^\(direct\)') THEN 'Direct or unknown'
+      ELSE 'Other' 
+    END AS channel,
+    s.src AS source_medium_raw,
+    s.has_user_id,
+    s.viewed_draw,
+    s.added_basket,
+    s.reached_basket,
+    s.started_checkout,
+    s.paid,
+    s.entry_stage,
+    s.furthest_stage
+  FROM raw_sessions s
+),
+cycles AS (
+  SELECT 
+    end_date AS cs, 
+    LEAD(end_date) OVER(ORDER BY end_date) AS next_cs
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_raffle`
+  WHERE is_closed = TRUE
+)
+SELECT 
+  c.session_date,
+  c.user_pseudo_id,
+  c.ga_session_id,
+  c.device_category,
+  c.channel,
+  c.source_medium_raw,
+  c.has_user_id,
+  c.viewed_draw,
+  c.added_basket,
+  c.reached_basket,
+  c.started_checkout,
+  c.paid,
+  c.entry_stage,
+  c.furthest_stage,
+  DATE_DIFF(c.session_date, cyc.cs, DAY) + 1 AS cycle_day,
+  CURRENT_TIMESTAMP() AS built_at
+FROM classified_sessions c
+LEFT JOIN cycles cyc 
+  ON c.session_date > cyc.cs 
+ AND (c.session_date <= cyc.next_cs OR cyc.next_cs IS NULL);
+
+-- =====================================================================
+-- SECTION 15: rpt_tracking_coverage_daily (rebuilt nightly from 2026-09-01)
 -- =====================================================================
 CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
 CLUSTER BY d
@@ -1765,6 +1896,14 @@ ga4_daily AS (
   WHERE date >= DATE '2026-09-01'
   GROUP BY 1
 ),
+funnel_daily AS (
+  SELECT
+    session_date AS d,
+    COUNT(*) AS ga4_sessions
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_session_funnel`
+  WHERE session_date >= DATE '2026-09-01'
+  GROUP BY 1
+),
 visit_sources AS (
   SELECT
     d,
@@ -1781,25 +1920,29 @@ SELECT
   COALESCE(o.orders, 0) AS orders,
   COALESCE(o.orders_tracked, 0) AS orders_tracked,
   ROUND(SAFE_DIVIDE(COALESCE(o.orders_tracked, 0), o.orders), 4) AS pct_tracked,
-  COALESCE(g.ga4_sessions, 0) AS ga4_sessions,
+  COALESCE(fn.ga4_sessions, g.ga4_sessions, 0) AS ga4_sessions,
   COALESCE(g.ga4_unassigned, 0) AS ga4_unassigned,
-  ROUND(SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), g.ga4_sessions), 4) AS pct_unassigned,
+  ROUND(SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), COALESCE(fn.ga4_sessions, g.ga4_sessions, 0)), 4) AS pct_unassigned,
   ROUND(SAFE_DIVIDE(v.granted_landings, v.visit_landings), 4) AS consent_granted_share,
   IF(dt.d < DATE '2026-10-19', CAST(ROUND(SAFE_DIVIDE(
     v.total_pv,
     SAFE_DIVIDE(v.granted_pv, v.granted_landings)
   )) AS INT64), NULL) AS est_visits,
   (
-    COALESCE(g.ga4_sessions, 0) > 0
-    AND SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), g.ga4_sessions) <= 0.20
+    COALESCE(fn.ga4_sessions, g.ga4_sessions, 0) > 0
+    AND SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), COALESCE(fn.ga4_sessions, g.ga4_sessions, 0)) <= 0.20
     AND (SAFE_DIVIDE(v.granted_landings, v.visit_landings) IS NULL OR SAFE_DIVIDE(v.granted_landings, v.visit_landings) >= 0.50)
   ) AS ga4_sessions_reliable,
-  COALESCE(g.ga4_sessions, 0) > 0 AS ga4_complete,
+  COALESCE(fn.ga4_sessions, g.ga4_sessions, 0) > 0 AS ga4_complete,
   CURRENT_TIMESTAMP() AS built_at
 FROM dates dt
 LEFT JOIN orders_daily o ON dt.d = o.d
 LEFT JOIN ga4_daily g ON dt.d = g.d
+LEFT JOIN funnel_daily fn ON dt.d = fn.d
 LEFT JOIN visit_sources v ON dt.d = v.d;
+
+ALTER TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
+  ALTER COLUMN ga4_sessions SET OPTIONS (description = 'distinct GA4 sessions (user_pseudo_id + ga_session_id)');
 
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_tracking_coverage_daily` AS
 SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`;
@@ -3557,6 +3700,46 @@ FROM (
     (SELECT SUM(orders) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_order_status_daily`) AS cur
 );
 
+-- GA4 session funnel health gate (freshness <= 2 days, daily sessions within +/-40% of trailing 7d avg)
+INSERT INTO `rh-ga4-491819.rh_curated_Bright_Test.dq_gate_results`
+  (run_ts, run_date, test, severity, result, source_value, curated_value, detail)
+WITH stats AS (
+  SELECT
+    session_date,
+    COUNT(*) as daily_sessions
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_session_funnel`
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 14 DAY)
+  GROUP BY 1
+),
+eval_day AS (
+  SELECT
+    MAX(session_date) AS max_date,
+    DATE_DIFF(CURRENT_DATE('Europe/London'), MAX(session_date), DAY) AS days_old
+  FROM stats
+),
+trailing_calc AS (
+  SELECT
+    e.max_date,
+    e.days_old,
+    s_eval.daily_sessions AS eval_sessions,
+    ROUND(AVG(s_prior.daily_sessions), 2) AS trailing_7d_avg,
+    ROUND(SAFE_DIVIDE(ABS(s_eval.daily_sessions - AVG(s_prior.daily_sessions)), AVG(s_prior.daily_sessions)) * 100, 2) AS pct_deviation
+  FROM eval_day e
+  JOIN stats s_eval ON s_eval.session_date = e.max_date
+  LEFT JOIN stats s_prior ON s_prior.session_date BETWEEN DATE_SUB(e.max_date, INTERVAL 7 DAY) AND DATE_SUB(e.max_date, INTERVAL 1 DAY)
+  GROUP BY 1, 2, 3
+)
+SELECT
+  v_run_ts,
+  DATE(v_run_ts),
+  'ga4_session_funnel_health' AS test,
+  'HARD' AS severity,
+  IF(days_old <= 2 AND pct_deviation <= 40.0, 'PASS', 'FAIL') AS result,
+  CAST(trailing_7d_avg AS NUMERIC) AS source_value,
+  CAST(eval_sessions AS NUMERIC) AS curated_value,
+  CONCAT('Latest date ', CAST(max_date AS STRING), ' has ', CAST(eval_sessions AS STRING), ' sessions vs 7d avg ', CAST(trailing_7d_avg AS STRING), ' (', CAST(pct_deviation AS STRING), '% dev, limit 40%), age = ', CAST(days_old AS STRING), ' days (limit 2)') AS detail
+FROM trailing_calc;
+
 -- Power BI data-health page reads this.
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_dq_gate_results` AS
 SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.dq_gate_results`;
@@ -3802,6 +3985,7 @@ BEGIN
     ('customer_ltv_horizons', 'current_tier_name', 'The website tier name of the customer active subscription (Bronze, Silver, Gold, Platinum, Other), NULL if none.', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_tracking_coverage_daily', 'est_visits', 'Estimated visits before the 19 Oct banner based on page views per consented visit. Not reliable after the 19 Oct banner; do not use (NULL from 19 Oct).', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_tracking_coverage_daily', 'consent_granted_share', 'Share of landings with privacy_info.analytics_storage = Yes. Before the 19 Oct banner, remaining 6-22% were NULL (unconfigured), with 0% denied.', 'none', 'approved', CURRENT_TIMESTAMP()),
+    ('rpt_tracking_coverage_daily', 'ga4_sessions', 'distinct GA4 sessions (user_pseudo_id + ga_session_id)', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_tracking_coverage_daily', 'ga4_complete', 'Whether GA4 daily export table events_YYYYMMDD has landed and been loaded for this date (excludes intraday pings).', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_visit_source_daily', 'ga4_complete', 'Whether this date was loaded from a finalized GA4 daily table events_YYYYMMDD (TRUE).', 'none', 'approved', CURRENT_TIMESTAMP()),
     ('rpt_paid_media_entity_daily', 'spend', 'Platform-reported ad spend excluding VAT in pounds.', 'none', 'approved', CURRENT_TIMESTAMP()),
