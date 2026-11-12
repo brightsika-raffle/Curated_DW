@@ -253,7 +253,7 @@ def save_raw_to_gcs(records: list, start_date: str, end_date: str, prefix: str =
             blob.upload_from_string(json.dumps(items, indent=2), content_type="application/json")
         print(f"Archived {len(records)} raw records across {len(grouped)} dates to gs://{GCS_BUCKET}/{clean_prefix}/")
     except Exception as e:
-        print(f"Warning: GCS archival skipped ({e})")
+        print(f"ERROR: GCS archival failed ({e})", file=sys.stderr)
 
 
 def load_into_bigquery(rows: list, start_date: str, end_date: str):
@@ -440,6 +440,8 @@ def load_reach_into_bigquery(client, window_days: int, window_start: str, window
                 time.sleep(5 * (attempt + 1))
             else:
                 raise
+    else:
+        raise RuntimeError(f"Failed to delete existing rows in {REACH_BQ_TABLE} for window_days = {window_days} after 5 attempts due to rate limits.")
     
     if not records:
         print(f"No reach records returned for window_days = {window_days}.")
@@ -487,6 +489,8 @@ def load_reach_into_bigquery(client, window_days: int, window_start: str, window
                 time.sleep(5 * (attempt + 1))
             else:
                 raise
+    else:
+        raise RuntimeError(f"Failed to load reach rows into {REACH_BQ_TABLE} for window_days = {window_days} after 5 attempts due to rate limits.")
     print(f"Loaded {len(rows)} reach rows for window_days = {window_days}.")
     return len(rows)
 
