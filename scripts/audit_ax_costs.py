@@ -33,3 +33,4 @@ print("-" * 110)
 for r in rows:
     q_prev = (r["query"] or "").replace("\n", " ").strip()[:75]
     print(f"{r['creation_time'].strftime('%H:%M:%S')} | {r['job_id'][:36]} | {r['gb_billed']:>6.3f} GB | £{r['cost_gbp']:>7.4f} | {q_prev}")
+

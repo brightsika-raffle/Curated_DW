@@ -1019,10 +1019,8 @@ CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_p
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_paid_media_entity`       AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_paid_media_entity`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_daily` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_status` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_status`;
-CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_order_audience_label`     AS SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_order_audience_label`;
-CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_ga4_prior_visit_daily`       AS SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_ga4_prior_visit_daily`;
-CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_meta_audience_compare_daily`
-OPTIONS (description = 'Daily Meta audience split: warehouse (Meta last touch, paid, first payment only) against Meta user_segment_key. Two buckets because engaged cannot be matched like for like yet. Totals differ: Meta counts 7-day click and view-through.')
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_meta_audience_compare_daily`
+OPTIONS (description = 'Daily Meta audience split: warehouse (Meta last touch, paid, first payment only) against Meta user_segment_key. Two buckets because engaged cannot be matched like for like yet. Rebuilt nightly.', labels = [('layer', 'report'), ('owner', 'bright_sika')])
 AS
 WITH w AS (
   SELECT purchase_date AS d, IF(audience_label = 'existing', 'existing', 'not_yet_customer') AS bucket,
@@ -2917,7 +2915,8 @@ fresh AS (
     DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(purchase_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`), DAY) AS tx_days,
     DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(created_date)  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_subscriptions`), DAY) AS sub_days,
     DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'google'), DAY) AS g_days,
-    DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'meta'),   DAY) AS m_days
+    DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_marketing_spend_daily` WHERE ad_platform = 'meta'),   DAY) AS m_days,
+    DATE_DIFF(CURRENT_DATE('Europe/London'), (SELECT MAX(spend_date) FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_segment_daily`), DAY) AS meta_segment_days
 ),
 spend_vat AS (
   SELECT
@@ -3446,6 +3445,7 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'fresh_transactions', 'HARD', IF(tx_d
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'fresh_subscriptions','WARN', IF(sub_days <= 2, 'PASS', 'WARN'), 2, sub_days, 'Days since latest new subscription' FROM fresh
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'fresh_google_spend', 'HARD', IF(g_days   <= 2, 'PASS', 'FAIL'), 2, g_days,   'Days since latest Google spend day' FROM fresh
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'fresh_meta_spend',   'WARN', IF(m_days   <= 3, 'PASS', 'WARN'), 3, m_days,   'Days since latest Meta spend day (manual upload)' FROM fresh
+UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'fresh_meta_segment', 'HARD', IF(meta_segment_days <= 2, 'PASS', 'FAIL'), 2, meta_segment_days, 'Days since latest Meta segment spend day in stg_meta_segment_daily (limit 2)' FROM fresh
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'vat_columns_consistent', 'HARD', IF(inconsistent_vat_rows = 0, 'PASS', 'FAIL'), 0, inconsistent_vat_rows, 'Every row has spend_inc_vat_gbp = ROUND(spend_ex_vat_gbp * 1.2, 2)' FROM spend_vat
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'spend_parity_unchanged', 'HARD', IF(sum_ex_vat = sum_orig_gbp, 'PASS', 'FAIL'), sum_orig_gbp, sum_ex_vat, 'SUM(spend_ex_vat_gbp) = SUM(spend_gbp)' FROM spend_vat
 UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'meta_funnel_classified', 'WARN', IF(meta_unknown_pct = 0, 'PASS', 'WARN'), 0, meta_unknown_pct, 'Share of Meta spend in Unknown from 2026-09-01 onwards, %' FROM spend_vat

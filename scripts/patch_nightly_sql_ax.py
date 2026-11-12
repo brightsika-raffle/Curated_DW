@@ -176,3 +176,4 @@ FROM w FULL JOIN m USING (d, bucket);"""
 
 if __name__ == '__main__':
     main()
+

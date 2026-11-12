@@ -100,3 +100,4 @@ print("\n--- AX4: GA4 Prior-Visit Share (1 Sep to 3 Nov) ---")
 res_ga4 = list(client.query(sql_ga4_new).result())
 for r in res_ga4:
     print(f"ga4_customer_type: {r.ga4_customer_type:<10} | purchases: {r.total_purchases} | with_prior: {r.with_prior_visit} | share: {r.prior_visit_share_pct}%")
+
