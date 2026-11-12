@@ -100,3 +100,4 @@ with_entity_ids AS (
 
 ## Problem Identified
 `extracted_meta_cid` matched only the numeric ID pattern (`^1202[0-9]{10,20}$`). When marketing migrated UTM links in mid-October to campaign names (e.g. `2026_Oct_London-Cornwall_241_Urgency_EndsToday`), `extracted_meta_cid` returned NULL. Because the name had no `PR`, `RMG`, or `RTG` substrings, the group fallback returned `Unknown`, and the revenue was assigned to `['ps', 'ps-unk']` with no campaign entity ID.
+

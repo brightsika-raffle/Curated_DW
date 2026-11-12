@@ -1080,8 +1080,8 @@ def main():
     # Mode: Backfill Audience Segments
     # -------------------------------------------------------------------------
     if args.backfill_segments:
-        s_start = "2026-09-01"
-        s_end = yesterday_str
+        s_start = args.start if args.start else "2026-09-01"
+        s_end = args.end if args.end else yesterday_str
         print(f"Meta Graph API Audience Segments Backfill (Version: {GRAPH_API_VERSION})")
         print(f"Ad Account: {AD_ACCOUNT_ID} | Range: {s_start} to {s_end}")
         if args.dry_run:
