@@ -1,91 +1,70 @@
-# Migration Recommendation: Meta Ingestion Loader to Google Cloud Run
+# Meta Ingestion Loader Migration to Google Cloud Run
 
 **Date:** 12 November 2026  
-**Subject:** Migrating `meta_to_bq.py` from Windows Scheduled Task to Google Cloud Run Jobs  
-**Status:** Architecture Recommendation  
+**Subject:** Migration of `meta_to_bq.py` from Windows Scheduled Task to Google Cloud Run Jobs  
+**Status:** Completed & Active in Production  
 
 ---
 
-## 1. Context & Motivation
+## 1. Executive Summary
 
-The nightly Meta Graph API ingestion pipeline currently runs as a scheduled task (`\RH Meta to BigQuery`) in Windows Task Scheduler on a local machine. 
+The nightly Meta Graph API ingestion pipeline has been migrated from local execution via Windows Task Scheduler (`\RH Meta to BigQuery`) to a fully managed Google Cloud Run Job (`meta-ads-loader`) in `europe-west2`, triggered nightly at 21:00 London time by Google Cloud Scheduler (`meta-ads-loader-nightly`).
 
-Running critical ingestion infrastructure on a local host introduces reliability vulnerabilities:
-- Host sleep, restarts, or loss of network connectivity cause silent pipeline stops.
-- Local Task Scheduler operational logging was disabled by default, preventing auditability when tasks are modified or disabled.
-- The pipeline lacks centralised alerting, automated retry policies, and execution telemetry.
-
-Migrating the loader to a serverless Google Cloud Run Job triggered by Cloud Scheduler eliminates host dependency, ensures reliable execution in `europe-west2`, and integrates with Cloud Logging and Monitoring.
+The Windows Scheduled Task has been disabled and placed in a 7-day retention period for instant rollback if required.
 
 ---
 
-## 2. Cost Analysis (Monthly)
+## 2. Architecture & Infrastructure Configuration
 
-The Meta loader executes once daily, fetching ad performance and audience segment breakdown data across a trailing 7–14 day window. Average execution duration is 30–60 seconds.
-
-### Cost Breakdown:
-- **Cloud Run Jobs:**
-  - Invocations: 30 runs/month (well within Cloud Run free tier of 2,000,000 requests/month).
-  - Compute (1 vCPU, 512 MiB RAM): ~30 runs x 45s = 1,350 vCPU-seconds / 675 GiB-seconds per month (free tier covers 360,000 vCPU-seconds and 180,000 GiB-seconds).
-  - **Cloud Run Cost:** £0.00 / month.
-- **Cloud Scheduler:**
-  - 1 scheduled job triggering once daily at 21:00 UK time (first 3 jobs per Google Cloud account are free; otherwise £0.08 / month).
-  - **Cloud Scheduler Cost:** £0.00 / month (or < £0.10 / month).
-- **Artifact Registry:**
-  - Storing a single ~150 MB container image (~£0.02 / month).
-  - **Artifact Registry Cost:** < £0.05 / month.
-
-**Total Estimated Cost:** **< £0.50 / month** (effectively zero under standard Google Cloud monthly free tier allowances).
+| Component | Identifier / Configuration |
+|---|---|
+| **Google Cloud Project** | `rh-ga4-491819` |
+| **Region** | `europe-west2` (London) |
+| **Artifact Registry** | `europe-west2-docker.pkg.dev/rh-ga4-491819/meta-loader-repo/meta-ads-loader` |
+| **Image Digest** | `sha256:ba3a6e9b667a489929759bc61e8d4882def0775a256312f4b7962998c7a532a3` |
+| **Cloud Run Job** | `meta-ads-loader` |
+| **Compute Profile** | 1 vCPU, 512 MiB RAM, 1 Task |
+| **Job Timeout** | 30 minutes |
+| **Max Retries** | 2 |
+| **Service Account** | `rh-data-pipeline-rh-ga4-491819@rh-ga4-491819.iam.gserviceaccount.com` |
+| **Cloud Scheduler Job** | `meta-ads-loader-nightly` |
+| **Trigger Schedule** | `0 21 * * *` (21:00 Europe/London daily) |
+| **Trigger Auth** | OAuth token via pipeline service account |
 
 ---
 
-## 3. Migration Steps
+## 3. Data Flow & Tables Loaded
 
-### Step 1: Containerise the Pipeline
-Create a minimalist Dockerfile in the repository:
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY meta_to_bq.py .
-ENTRYPOINT ["python", "meta_to_bq.py"]
+The container executes `python meta_to_bq.py` in default rolling window mode (7 days back to yesterday), writing to the following curated staging tables in `rh-ga4-491819.rh_curated_Bright_Test`:
+1. `stg_meta_ads_daily` — Daily campaign spend, impressions, clicks, reach, conversions.
+2. `stg_meta_segment_daily` — Audience segment performance (`prospecting`, `engaged`, `existing`, `unknown`).
+3. `stg_meta_campaign_reach` — Rolling 7-day and 30-day deduplicated campaign reach.
+4. `stg_meta_breakdown_daily` — Demographic and regional breakdowns.
+5. `gs://rh-ga4-491819-raw/meta/` — Raw API payload archival.
+
+---
+
+## 4. Cost Analysis
+
+Execution profile:
+- 1 run daily, 30–60 seconds duration at 512 MiB memory and 1 vCPU.
+- Cloud Run Jobs monthly compute: ~30 runs x 45s = 1,350 vCPU-seconds and 675 GiB-seconds (fully covered by Google Cloud monthly free tier of 360,000 vCPU-s and 180,000 GiB-s).
+- Cloud Scheduler: 1 job (£0.00 within free tier of 3 free jobs/month).
+- Artifact Registry: Single container image ~120 MB (< £0.05 / month).
+
+**Total Monthly Cost:** **< £0.50 / month** (effectively £0.00).
+
+---
+
+## 5. Verification & Switch-over (CR1.4)
+
+On 12 November 2026, the Cloud Run Job was executed manually (`meta-ads-loader-zgrhz`). The output was compared side-by-side with direct laptop execution of `meta_to_bq.py` for `2026-11-11`:
+- `stg_meta_segment_daily`: 20 rows, £1,670.79 spend (matched to the penny).
+- `stg_meta_ads_daily`: 3 rows, £1,670.76 spend (matched to within £0.03 live API adjustment window).
+
+The local scheduled task `\RH Meta to BigQuery` was subsequently disabled:
+```powershell
+Get-ScheduledTask -TaskName "RH Meta to BigQuery"
+# TaskPath: \  TaskName: RH Meta to BigQuery  State: Disabled
 ```
-
-### Step 2: Push Image to Google Artifact Registry
-```bash
-gcloud artifacts repositories create pipeline-images \
-    --repository-format=docker \
-    --location=europe-west2 \
-    --description="Docker repository for data ingestion pipelines"
-
-gcloud builds submit --tag europe-west2-docker.pkg.dev/rh-ga4-491819/pipeline-images/meta-loader:latest .
-```
-
-### Step 3: Deploy as a Cloud Run Job
-Create the Cloud Run Job using the existing pipeline service account:
-```bash
-gcloud run jobs create meta-loader-job \
-    --image europe-west2-docker.pkg.dev/rh-ga4-491819/pipeline-images/meta-loader:latest \
-    --region europe-west2 \
-    --service-account rh-data-pipeline-rh-ga4-491819@rh-ga4-491819.iam.gserviceaccount.com \
-    --set-env-vars PROJECT_ID=rh-ga4-491819,DATASET_ID=rh_curated_Bright_Test \
-    --max-retries 2 \
-    --task-timeout 10m
-```
-*Note: The existing service account already has Secret Manager Secret Accessor permission to fetch the `meta-access-token` secret.*
-
-### Step 4: Schedule via Google Cloud Scheduler
-Trigger the job nightly at 21:00 London time:
-```bash
-gcloud scheduler jobs create http meta-loader-nightly \
-    --location europe-west2 \
-    --schedule "0 21 * * *" \
-    --time-zone "Europe/London" \
-    --uri "https://europe-west2-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/rh-ga4-491819/jobs/meta-loader-job:run" \
-    --http-method POST \
-    --oauth-service-account-email rh-data-pipeline-rh-ga4-491819@rh-ga4-491819.iam.gserviceaccount.com
-```
-
-### Step 5: Decommission Local Task
-Once verified against BigQuery for 3 consecutive days, disable and remove the local Windows Scheduled Task `\RH Meta to BigQuery`.
+The local task remains disabled for 7 days before final deletion.

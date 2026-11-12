@@ -51,7 +51,8 @@ def get_gcp_credentials():
         pass
     
     from google.oauth2.credentials import Credentials
-    res = subprocess.run(["gcloud.cmd", "auth", "print-access-token"], capture_output=True, text=True, check=True)
+    cmd = "gcloud.cmd" if sys.platform.startswith("win") else "gcloud"
+    res = subprocess.run([cmd, "auth", "print-access-token"], capture_output=True, text=True, check=True)
     return Credentials(res.stdout.strip())
 
 
@@ -244,12 +245,15 @@ def save_raw_to_gcs(records: list, start_date: str, end_date: str, prefix: str =
         grouped.setdefault(d, []).append(r)
         
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    clean_prefix = prefix.strip("/")
-    for d, items in grouped.items():
-        blob_path = f"{clean_prefix}/dt={d}/insights_{ts}.json"
-        blob = bucket.blob(blob_path)
-        blob.upload_from_string(json.dumps(items, indent=2), content_type="application/json")
-    print(f"Archived {len(records)} raw records across {len(grouped)} dates to gs://{GCS_BUCKET}/{clean_prefix}/")
+    try:
+        clean_prefix = prefix.strip("/")
+        for d, items in grouped.items():
+            blob_path = f"{clean_prefix}/dt={d}/insights_{ts}.json"
+            blob = bucket.blob(blob_path)
+            blob.upload_from_string(json.dumps(items, indent=2), content_type="application/json")
+        print(f"Archived {len(records)} raw records across {len(grouped)} dates to gs://{GCS_BUCKET}/{clean_prefix}/")
+    except Exception as e:
+        print(f"Warning: GCS archival skipped ({e})")
 
 
 def load_into_bigquery(rows: list, start_date: str, end_date: str):
@@ -420,12 +424,22 @@ def ensure_reach_table_exists(client, table_id: str = REACH_BQ_TABLE):
 
 
 def load_reach_into_bigquery(client, window_days: int, window_start: str, window_end: str, records: list) -> int:
-    """Replace rows for the specified window in stg_meta_campaign_reach."""
+    """Replace rows for the specified window in stg_meta_campaign_reach with backoff on rate limits."""
+    import time
     ensure_reach_table_exists(client, REACH_BQ_TABLE)
     
     del_sql = f"DELETE FROM `{REACH_BQ_TABLE}` WHERE window_days = {window_days}"
     print(f"Replacing rows in {REACH_BQ_TABLE} for window_days = {window_days} ({window_start} to {window_end})...")
-    client.query(del_sql).result()
+    for attempt in range(5):
+        try:
+            client.query(del_sql).result()
+            break
+        except Exception as e:
+            if "rateLimitExceeded" in str(e) or "too many table update operations" in str(e):
+                print(f"BigQuery table rate limit on reach DELETE. Backing off {5 * (attempt + 1)}s...")
+                time.sleep(5 * (attempt + 1))
+            else:
+                raise
     
     if not records:
         print(f"No reach records returned for window_days = {window_days}.")
@@ -461,8 +475,18 @@ def load_reach_into_bigquery(client, window_days: int, window_start: str, window
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         labels={"datacloud": "antigravity", "purpose": "meta_feed"}
     )
-    job = client.load_table_from_json(rows, REACH_BQ_TABLE, job_config=job_config)
-    job.result()
+    for attempt in range(5):
+        try:
+            time.sleep(2)
+            job = client.load_table_from_json(rows, REACH_BQ_TABLE, job_config=job_config)
+            job.result()
+            break
+        except Exception as e:
+            if "rateLimitExceeded" in str(e) or "too many table update operations" in str(e):
+                print(f"BigQuery table rate limit on reach load. Backing off {5 * (attempt + 1)}s...")
+                time.sleep(5 * (attempt + 1))
+            else:
+                raise
     print(f"Loaded {len(rows)} reach rows for window_days = {window_days}.")
     return len(rows)
 
@@ -1013,7 +1037,7 @@ def run_segments_for_range(token: str, bq_client, start_date: str, end_date: str
 
 def append_daily_log(date_range: str, rows_loaded: int, spend_total: float, status: str, error_msg: str = ""):
     """Write a one-line log per run to logs/meta_daily.log with masked tokens."""
-    log_dir = r"C:\Users\bryte\Downloads\Raffle-House_DW\logs"
+    log_dir = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "meta_daily.log")
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1027,8 +1051,9 @@ def append_daily_log(date_range: str, rows_loaded: int, spend_total: float, stat
 
 
 def main():
-    # Ensure service account impersonation is default if not set
-    os.environ.setdefault("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", "rh-data-pipeline-rh-ga4-491819@rh-ga4-491819.iam.gserviceaccount.com")
+    # Ensure service account impersonation is default if not set (local dev only, not in Cloud Run)
+    if "CLOUD_RUN_JOB" not in os.environ and "K_SERVICE" not in os.environ:
+        os.environ.setdefault("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", "rh-data-pipeline-rh-ga4-491819@rh-ga4-491819.iam.gserviceaccount.com")
     
     parser = argparse.ArgumentParser(description="Load Meta Ads Insights into BigQuery")
     parser.add_argument("--start", required=False, default=None, help="Start date (YYYY-MM-DD)")

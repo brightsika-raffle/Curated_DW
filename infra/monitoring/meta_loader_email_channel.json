@@ -1,0 +1,9 @@
+{
+  "type": "email",
+  "displayName": "Bright (Pipeline Alerts)",
+  "description": "Email alerts for data pipeline and Meta loader failures",
+  "labels": {
+    "email_address": "bright@raffle-house.com"
+  },
+  "enabled": true
+}

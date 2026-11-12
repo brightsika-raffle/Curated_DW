@@ -1,0 +1,22 @@
+.git
+.github
+.venv*
+__pycache__
+*.pyc
+.env*
+backups/
+scratch/
+logs/
+Claude outputs/
+winner-portal/
+reference/
+mmm/
+automation/
+*.xlsx
+*.csv
+*.md
+*.ps1
+*.json
+*.tgz
+*.zip
+*.bak

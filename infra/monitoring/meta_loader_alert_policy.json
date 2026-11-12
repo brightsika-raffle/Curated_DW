@@ -1,0 +1,27 @@
+{
+  "displayName": "RH Pipeline: Meta Ads Loader Cloud Run Job Failure",
+  "documentation": {
+    "content": "Cloud Run Job `meta-ads-loader` failed or logged an ERROR. Check Cloud Run execution logs in rh-ga4-491819 (europe-west2): https://console.cloud.google.com/run/jobs/details/europe-west2/meta-ads-loader/executions?project=rh-ga4-491819",
+    "mimeType": "text/markdown"
+  },
+  "userLabels": {
+    "environment": "production",
+    "component": "meta-loader"
+  },
+  "conditions": [
+    {
+      "displayName": "Cloud Run Job Execution Failed or Error Logged",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"meta-ads-loader\" AND (severity>=ERROR OR textPayload=~\"ERROR\" OR jsonPayload.message=~\"ERROR\")"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "3600s"
+    },
+    "autoClose": "86400s"
+  },
+  "combiner": "OR",
+  "enabled": true
+}
