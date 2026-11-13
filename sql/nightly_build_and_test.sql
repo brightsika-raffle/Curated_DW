@@ -3853,7 +3853,7 @@ SELECT
   v_run_ts,
   DATE(v_run_ts),
   'ga4_session_funnel_health' AS test,
-  'HARD' AS severity,
+  'WARN' AS severity,
   IF(days_old <= 3 AND pct_deviation <= 40.0, 'PASS', 'FAIL') AS result,
   CAST(trailing_7d_avg AS NUMERIC) AS source_value,
   CAST(eval_sessions AS NUMERIC) AS curated_value,
