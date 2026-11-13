@@ -10,3 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY meta_to_bq.py .
 
 ENTRYPOINT ["python", "meta_to_bq.py"]
+

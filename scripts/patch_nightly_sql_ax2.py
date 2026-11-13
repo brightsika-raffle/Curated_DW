@@ -75,3 +75,4 @@ UNION ALL SELECT v_run_ts, DATE(v_run_ts), 'fresh_meta_segment', 'HARD', IF(meta
 
 if __name__ == '__main__':
     main()
+

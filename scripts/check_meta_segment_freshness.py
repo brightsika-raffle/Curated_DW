@@ -15,3 +15,4 @@ FROM `rh-ga4-491819.rh_curated_Bright_Test.stg_meta_segment_daily`
 """
 row = list(client.query(sql).result())[0]
 print(f"Max spend date: {row.max_spend_date}, Today: {row.today_london}, Diff: {row.meta_segment_days} days")
+

@@ -65,3 +65,4 @@ print("\n[Step 4] Dropping view vw_meta_audience_compare_daily...")
 drop_sql = "DROP VIEW IF EXISTS `rh-ga4-491819.rh_curated_Bright_Test.vw_meta_audience_compare_daily`"
 client.query(drop_sql).result()
 print("View dropped successfully.")
+

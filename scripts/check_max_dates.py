@@ -14,3 +14,4 @@ d2 = list(client.query(sql2).result())[0].max_d
 
 print(f"fact_order_audience_label max purchase_date: {d1}")
 print(f"rpt_ga4_prior_visit_daily max purchase_date:  {d2}")
+

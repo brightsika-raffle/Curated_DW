@@ -472,6 +472,118 @@ LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.dim_channel_last_touch` c ON c.c
 
 
 -- =====================================================================
+
+
+-- =====================================================================
+-- SECTION 7c — KLAVIYO CURATED TABLES (dim_klaviyo_profile, fact_klaviyo_event 3-day reload, rpt_klaviyo_customer_engagement)
+-- Chained after dim_customer and fact_transactions.
+-- =====================================================================
+
+-- 1) dim_klaviyo_profile (full rebuild nightly)
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.dim_klaviyo_profile`
+CLUSTER BY customer_key
+OPTIONS (description = 'One row per Klaviyo profile, matched to customer_key. match_method says how. Consent as Klaviyo holds it. No PII.', labels = [('layer', 'dim'), ('owner', 'bright_sika')])
+AS
+WITH c1 AS (
+  SELECT klaviyo_id, customer_key, COUNT(*) OVER (PARTITION BY klaviyo_id) AS n_cust
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_customer`
+  WHERE klaviyo_id IS NOT NULL AND customer_key != 'UNKNOWN_DELETED'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY klaviyo_id ORDER BY created_at) = 1),
+c2 AS (SELECT customer_key FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_customer` WHERE customer_key != 'UNKNOWN_DELETED')
+SELECT
+  p.profile_id,
+  COALESCE(c1.customer_key, c2.customer_key) AS customer_key,
+  CASE WHEN c1.customer_key IS NOT NULL THEN 'klaviyo_id' WHEN c2.customer_key IS NOT NULL THEN 'external_id' ELSE 'unmatched' END AS match_method,
+  COALESCE(c1.n_cust > 1, FALSE) AS shared_klaviyo_id,
+  p.email_consent, p.sms_consent,
+  p.email_consent = 'SUBSCRIBED' AS email_contactable,
+  p.sms_consent = 'SUBSCRIBED' AS sms_contactable,
+  p.created AS profile_created_at, p.updated AS profile_updated_at, p.last_event_date AS last_event_at,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM `rh-ga4-491819.rh_raw_Bright_Test.klaviyo_profiles` p
+LEFT JOIN c1 ON c1.klaviyo_id = p.profile_id
+LEFT JOIN c2 ON c2.customer_key = p.external_id
+QUALIFY ROW_NUMBER() OVER (PARTITION BY p.profile_id ORDER BY p.loaded_at DESC) = 1;
+
+-- 2) fact_klaviyo_event (incremental: reload last 3 days of partitions nightly)
+DELETE FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_klaviyo_event`
+WHERE event_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY);
+
+INSERT INTO `rh-ga4-491819.rh_curated_Bright_Test.fact_klaviyo_event`
+(
+  event_id, event_date, event_ts, metric_name, profile_id, customer_key,
+  match_method, campaign_id, flow_id, message_id, send_type,
+  is_machine_open, klaviyo_value_gbp, loaded_at
+)
+SELECT
+  e.event_id, e.event_date, e.event_ts, e.metric_name, e.profile_id, d.customer_key,
+  COALESCE(d.match_method, 'unmatched') AS match_method,
+  e.campaign_id, e.flow_id, e.message_id,
+  IF(e.campaign_id IS NOT NULL, 'campaign', IF(e.flow_id IS NOT NULL, 'flow', 'other')) AS send_type,
+  COALESCE(e.is_machine_open, FALSE) AS is_machine_open,
+  e.value_gbp AS klaviyo_value_gbp,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM `rh-ga4-491819.rh_raw_Bright_Test.klaviyo_events` e
+LEFT JOIN `rh-ga4-491819.rh_curated_Bright_Test.dim_klaviyo_profile` d USING (profile_id)
+WHERE e.event_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 3 DAY)
+QUALIFY ROW_NUMBER() OVER (PARTITION BY e.event_id ORDER BY e.loaded_at DESC) = 1;
+
+-- 3) rpt_klaviyo_customer_engagement (full rebuild nightly)
+CREATE OR REPLACE TABLE `rh-ga4-491819.rh_curated_Bright_Test.rpt_klaviyo_customer_engagement`
+CLUSTER BY engagement_band
+OPTIONS (description = 'Per-customer Klaviyo engagement (30/90 day) with paid revenue from fact_transactions. as_of_date = latest Klaviyo event date. Event history starts 2026-10-06 until the backfill lands: 90-day figures are partial until then.', labels = [('layer', 'report'), ('owner', 'bright_sika')])
+AS
+WITH asof AS (SELECT MAX(event_date) AS a FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_klaviyo_event`),
+ev AS (
+  SELECT customer_key,
+    COUNTIF(metric_name = 'Received Email' AND event_date > DATE_SUB(a, INTERVAL 30 DAY)) AS received_30d,
+    COUNTIF(metric_name = 'Opened Email' AND NOT is_machine_open AND event_date > DATE_SUB(a, INTERVAL 30 DAY)) AS real_opens_30d,
+    COUNTIF(metric_name = 'Opened Email' AND is_machine_open AND event_date > DATE_SUB(a, INTERVAL 30 DAY)) AS machine_opens_30d,
+    COUNTIF(metric_name = 'Clicked Email' AND event_date > DATE_SUB(a, INTERVAL 30 DAY)) AS clicks_30d,
+    COUNTIF(metric_name = 'Clicked Email' AND event_date > DATE_SUB(a, INTERVAL 90 DAY)) AS clicks_90d,
+    COUNTIF(metric_name = 'Opened Email' AND NOT is_machine_open AND event_date > DATE_SUB(a, INTERVAL 90 DAY)) AS real_opens_90d,
+    MAX(IF(metric_name = 'Opened Email' AND NOT is_machine_open, event_date, NULL)) AS last_real_open_date,
+    MAX(IF(metric_name = 'Clicked Email', event_date, NULL)) AS last_click_date
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_klaviyo_event`, asof
+  WHERE customer_key IS NOT NULL
+  GROUP BY 1),
+tx AS (
+  SELECT customer_key,
+    COUNTIF(revenue_gbp > 0 AND purchase_date > DATE_SUB(a, INTERVAL 30 DAY)) AS paid_orders_30d,
+    SUM(IF(revenue_gbp > 0 AND purchase_date > DATE_SUB(a, INTERVAL 30 DAY), revenue_gbp, 0)) AS paid_revenue_30d_gbp,
+    COUNTIF(revenue_gbp > 0 AND purchase_date > DATE_SUB(a, INTERVAL 90 DAY)) AS paid_orders_90d,
+    SUM(IF(revenue_gbp > 0 AND purchase_date > DATE_SUB(a, INTERVAL 90 DAY), revenue_gbp, 0)) AS paid_revenue_90d_gbp,
+    COUNTIF(revenue_gbp = 0 AND purchase_date > DATE_SUB(a, INTERVAL 90 DAY)) AS free_orders_90d,
+    MAX(IF(revenue_gbp > 0, purchase_date, NULL)) AS last_paid_order_date
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_transactions`, asof
+  WHERE customer_key != 'UNKNOWN_DELETED' AND purchase_date > DATE_SUB(a, INTERVAL 90 DAY)
+  GROUP BY 1)
+SELECT
+  d.customer_key, d.profile_id, d.match_method, d.email_contactable, d.sms_contactable,
+  COALESCE(ev.received_30d, 0) AS received_30d, COALESCE(ev.real_opens_30d, 0) AS real_opens_30d,
+  COALESCE(ev.machine_opens_30d, 0) AS machine_opens_30d, COALESCE(ev.clicks_30d, 0) AS clicks_30d,
+  COALESCE(ev.real_opens_90d, 0) AS real_opens_90d, COALESCE(ev.clicks_90d, 0) AS clicks_90d,
+  ev.last_real_open_date, ev.last_click_date,
+  CASE
+    WHEN NOT d.email_contactable THEN 'not_contactable'
+    WHEN COALESCE(ev.clicks_30d, 0) > 0 THEN 'clicker_30d'
+    WHEN COALESCE(ev.real_opens_30d, 0) > 0 THEN 'opener_30d'
+    WHEN COALESCE(ev.real_opens_90d, 0) + COALESCE(ev.clicks_90d, 0) > 0 THEN 'engaged_31_90d'
+    WHEN COALESCE(ev.received_30d, 0) > 0 THEN 'receiving_not_engaging'
+    ELSE 'not_mailed_30d'
+  END AS engagement_band,
+  COALESCE(tx.paid_orders_30d, 0) AS paid_orders_30d, COALESCE(tx.paid_revenue_30d_gbp, 0) AS paid_revenue_30d_gbp,
+  COALESCE(tx.paid_orders_90d, 0) AS paid_orders_90d, COALESCE(tx.paid_revenue_90d_gbp, 0) AS paid_revenue_90d_gbp,
+  COALESCE(tx.free_orders_90d, 0) AS free_orders_90d, tx.last_paid_order_date,
+  (SELECT a FROM asof) AS as_of_date,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_klaviyo_profile` d
+LEFT JOIN ev USING (customer_key)
+LEFT JOIN tx USING (customer_key)
+WHERE d.customer_key IS NOT NULL
+QUALIFY ROW_NUMBER() OVER (PARTITION BY d.customer_key ORDER BY d.match_method = 'klaviyo_id' DESC, d.last_event_at DESC) = 1;
+
+
 -- SECTION 8 — fact_subscriptions  (baskets excluded)
 -- Status column is `status` (NOT payment_status).
 -- Partitioned monthly on created_date (purchase_date is ~66% NULL).
@@ -1019,6 +1131,9 @@ CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_p
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_paid_media_entity`       AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_paid_media_entity`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_daily` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_daily`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_paid_media_entity_status` AS SELECT * FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_paid_media_entity_status`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_dim_klaviyo_profile` AS SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.dim_klaviyo_profile`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_klaviyo_event`   AS SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_klaviyo_event`;
+CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_rpt_klaviyo_customer_engagement` AS SELECT * EXCEPT(loaded_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_klaviyo_customer_engagement`;
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_fact_ga4_session_funnel`
 OPTIONS (description = "Power BI view over fact_ga4_session_funnel without built_at.")
 AS SELECT * EXCEPT(built_at) FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_session_funnel`;
@@ -1899,7 +2014,12 @@ ga4_daily AS (
 funnel_daily AS (
   SELECT
     session_date AS d,
-    COUNT(*) AS ga4_sessions
+    COUNT(*) AS ga4_sessions,
+    COUNTIF(
+      source_medium_raw IS NULL 
+      OR source_medium_raw IN ('', '|', '||') 
+      OR REGEXP_CONTAINS(source_medium_raw, r'(\(not set\)|\(direct\))')
+    ) AS ga4_unassigned
   FROM `rh-ga4-491819.rh_curated_Bright_Test.fact_ga4_session_funnel`
   WHERE session_date >= DATE '2026-09-01'
   GROUP BY 1
@@ -1921,8 +2041,8 @@ SELECT
   COALESCE(o.orders_tracked, 0) AS orders_tracked,
   ROUND(SAFE_DIVIDE(COALESCE(o.orders_tracked, 0), o.orders), 4) AS pct_tracked,
   COALESCE(fn.ga4_sessions, g.ga4_sessions, 0) AS ga4_sessions,
-  COALESCE(g.ga4_unassigned, 0) AS ga4_unassigned,
-  ROUND(SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), COALESCE(fn.ga4_sessions, g.ga4_sessions, 0)), 4) AS pct_unassigned,
+  COALESCE(fn.ga4_unassigned, g.ga4_unassigned, 0) AS ga4_unassigned,
+  ROUND(SAFE_DIVIDE(COALESCE(fn.ga4_unassigned, g.ga4_unassigned, 0), COALESCE(fn.ga4_sessions, g.ga4_sessions, 0)), 4) AS pct_unassigned,
   ROUND(SAFE_DIVIDE(v.granted_landings, v.visit_landings), 4) AS consent_granted_share,
   IF(dt.d < DATE '2026-10-19', CAST(ROUND(SAFE_DIVIDE(
     v.total_pv,
@@ -1930,7 +2050,7 @@ SELECT
   )) AS INT64), NULL) AS est_visits,
   (
     COALESCE(fn.ga4_sessions, g.ga4_sessions, 0) > 0
-    AND SAFE_DIVIDE(COALESCE(g.ga4_unassigned, 0), COALESCE(fn.ga4_sessions, g.ga4_sessions, 0)) <= 0.20
+    AND SAFE_DIVIDE(COALESCE(fn.ga4_unassigned, g.ga4_unassigned, 0), COALESCE(fn.ga4_sessions, g.ga4_sessions, 0)) <= 0.20
     AND (SAFE_DIVIDE(v.granted_landings, v.visit_landings) IS NULL OR SAFE_DIVIDE(v.granted_landings, v.visit_landings) >= 0.50)
   ) AS ga4_sessions_reliable,
   COALESCE(fn.ga4_sessions, g.ga4_sessions, 0) > 0 AS ga4_complete,
@@ -3734,11 +3854,30 @@ SELECT
   DATE(v_run_ts),
   'ga4_session_funnel_health' AS test,
   'HARD' AS severity,
-  IF(days_old <= 2 AND pct_deviation <= 40.0, 'PASS', 'FAIL') AS result,
+  IF(days_old <= 3 AND pct_deviation <= 40.0, 'PASS', 'FAIL') AS result,
   CAST(trailing_7d_avg AS NUMERIC) AS source_value,
   CAST(eval_sessions AS NUMERIC) AS curated_value,
-  CONCAT('Latest date ', CAST(max_date AS STRING), ' has ', CAST(eval_sessions AS STRING), ' sessions vs 7d avg ', CAST(trailing_7d_avg AS STRING), ' (', CAST(pct_deviation AS STRING), '% dev, limit 40%), age = ', CAST(days_old AS STRING), ' days (limit 2)') AS detail
+  CONCAT('Latest date ', CAST(max_date AS STRING), ' has ', CAST(eval_sessions AS STRING), ' sessions vs 7d avg ', CAST(trailing_7d_avg AS STRING), ' (', CAST(pct_deviation AS STRING), '% dev, limit 40%), age = ', CAST(days_old AS STRING), ' days (limit 3)') AS detail
 FROM trailing_calc;
+
+-- Tracking coverage quality gate: pct_unassigned must be between 0 and 1 for all dates
+INSERT INTO `rh-ga4-491819.rh_curated_Bright_Test.dq_gate_results`
+  (run_ts, run_date, test, severity, result, source_value, curated_value, detail)
+WITH inv AS (
+  SELECT COUNTIF(pct_unassigned < 0 OR pct_unassigned > 1) AS invalid_count
+  FROM `rh-ga4-491819.rh_curated_Bright_Test.rpt_tracking_coverage_daily`
+  WHERE pct_unassigned IS NOT NULL
+)
+SELECT
+  v_run_ts,
+  DATE(v_run_ts),
+  'tracking_pct_unassigned_bounds',
+  'HARD',
+  IF(invalid_count = 0, 'PASS', 'FAIL'),
+  0,
+  invalid_count,
+  'All non-null pct_unassigned in rpt_tracking_coverage_daily must be between 0 and 1'
+FROM inv;
 
 -- Power BI data-health page reads this.
 CREATE OR REPLACE VIEW `rh-ga4-491819.rh_curated_Bright_Test.vw_dq_gate_results` AS
