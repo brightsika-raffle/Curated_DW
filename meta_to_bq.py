@@ -28,6 +28,8 @@ HISTORY_BQ_TABLE = "rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily_hist
 REACH_BQ_TABLE = "rh-ga4-491819.rh_curated_Bright_Test.stg_meta_campaign_reach"
 BREAKDOWN_BQ_TABLE = "rh-ga4-491819.rh_curated_Bright_Test.stg_meta_breakdown_daily"
 SEGMENT_BQ_TABLE = "rh-ga4-491819.rh_curated_Bright_Test.stg_meta_segment_daily"
+AD_BQ_TABLE = "rh-ga4-491819.rh_curated_Bright_Test.stg_meta_ads_daily_ad"
+AD_STAGE_TABLE = "rh-ga4-491819.rh_curated_Bright_Test._stage_stg_meta_ads_daily_ad"
 SECRET_ID = "meta-access-token"
 GCP_PROJECT = "rh-ga4-491819"
 
@@ -1039,6 +1041,157 @@ def run_segments_for_range(token: str, bq_client, start_date: str, end_date: str
     return inserted
 
 
+def fetch_meta_ad_insights(token: str, start_date: str, end_date: str) -> list:
+    """Fetch ad-level daily insights, handling pagination & rate limits."""
+    fields = [
+        "date_start",
+        "account_id",
+        "account_name",
+        "campaign_id",
+        "campaign_name",
+        "adset_id",
+        "adset_name",
+        "ad_id",
+        "ad_name",
+        "spend",
+        "impressions",
+        "reach",
+        "clicks",
+        "actions",
+        "action_values"
+    ]
+    base_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{AD_ACCOUNT_ID}/insights"
+    params = {
+        "access_token": token,
+        "level": "ad",
+        "time_increment": "1",
+        "time_range": json.dumps({"since": start_date, "until": end_date}),
+        "fields": ",".join(fields),
+        "limit": "500"
+    }
+    all_data = []
+    url = f"{base_url}?{urllib.parse.urlencode(params)}"
+    while url:
+        data = make_meta_request_with_retry(url)
+        all_data.extend(data.get("data", []))
+        url = data.get("paging", {}).get("next")
+    return all_data
+
+
+def transform_ad_records(raw_records: list) -> list:
+    """Transform Meta ad-level insights into stg_meta_ads_daily_ad schema rows."""
+    transformed = []
+    loaded_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    for r in raw_records:
+        purchases, purchase_val, link_clicks, _ = extract_metrics(r)
+        spend = round(float(r.get("spend", 0.0)), 2)
+        transformed.append({
+            "date": r.get("date_start"),
+            "account_id": str(r.get("account_id") or ACCOUNT_ID_NUMERIC),
+            "account_name": str(r.get("account_name") or "Raffle House"),
+            "campaign_id": str(r.get("campaign_id", "")),
+            "campaign_name": str(r.get("campaign_name", "")),
+            "adset_id": str(r.get("adset_id", "")),
+            "adset_name": str(r.get("adset_name", "")),
+            "ad_id": str(r.get("ad_id", "")),
+            "ad_name": str(r.get("ad_name", "")),
+            "spend": spend,
+            "spend_gbp": spend,
+            "impressions": int(r.get("impressions", 0)),
+            "reach": int(r.get("reach", 0)),
+            "clicks": int(r.get("clicks", 0)),
+            "link_clicks": link_clicks,
+            "purchases": round(purchases, 2),
+            "purchase_value": round(purchase_val, 2),
+            "platform_conversions": round(purchases, 2),
+            "platform_conversion_value_gbp": round(purchase_val, 2),
+            "loaded_at": loaded_at,
+        })
+    return transformed
+
+
+def load_ads_into_bigquery(client, rows: list, start_date: str, end_date: str) -> int:
+    """Load ad-level rows into staging table, then MERGE into stg_meta_ads_daily_ad."""
+    if not rows:
+        print("No ad-level rows to load.")
+        return 0
+    from google.cloud import bigquery
+    schema = [
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("account_id", "STRING"),
+        bigquery.SchemaField("account_name", "STRING"),
+        bigquery.SchemaField("campaign_id", "STRING"),
+        bigquery.SchemaField("campaign_name", "STRING"),
+        bigquery.SchemaField("adset_id", "STRING"),
+        bigquery.SchemaField("adset_name", "STRING"),
+        bigquery.SchemaField("ad_id", "STRING"),
+        bigquery.SchemaField("ad_name", "STRING"),
+        bigquery.SchemaField("spend", "NUMERIC"),
+        bigquery.SchemaField("spend_gbp", "NUMERIC"),
+        bigquery.SchemaField("impressions", "INTEGER"),
+        bigquery.SchemaField("reach", "INTEGER"),
+        bigquery.SchemaField("clicks", "INTEGER"),
+        bigquery.SchemaField("link_clicks", "INTEGER"),
+        bigquery.SchemaField("purchases", "NUMERIC"),
+        bigquery.SchemaField("purchase_value", "NUMERIC"),
+        bigquery.SchemaField("platform_conversions", "NUMERIC"),
+        bigquery.SchemaField("platform_conversion_value_gbp", "NUMERIC"),
+        bigquery.SchemaField("loaded_at", "TIMESTAMP"),
+    ]
+    job_config = bigquery.LoadJobConfig(
+        schema=schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        labels={"datacloud": "antigravity", "purpose": "meta_feed"},
+    )
+    print(f"Loading {len(rows)} ad-level rows into staging table {AD_STAGE_TABLE}...")
+    client.load_table_from_json(rows, AD_STAGE_TABLE, job_config=job_config).result()
+
+    merge_sql = f"""
+    MERGE `{AD_BQ_TABLE}` T
+    USING `{AD_STAGE_TABLE}` S
+    ON T.date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+      AND T.date = S.date
+      AND T.ad_id = S.ad_id
+    WHEN MATCHED THEN UPDATE SET
+      account_id = S.account_id,
+      account_name = S.account_name,
+      campaign_id = S.campaign_id,
+      campaign_name = S.campaign_name,
+      adset_id = S.adset_id,
+      adset_name = S.adset_name,
+      ad_name = S.ad_name,
+      spend = S.spend,
+      spend_gbp = S.spend_gbp,
+      impressions = S.impressions,
+      reach = S.reach,
+      clicks = S.clicks,
+      link_clicks = S.link_clicks,
+      purchases = S.purchases,
+      purchase_value = S.purchase_value,
+      platform_conversions = S.platform_conversions,
+      platform_conversion_value_gbp = S.platform_conversion_value_gbp,
+      loaded_at = S.loaded_at
+    WHEN NOT MATCHED THEN INSERT ROW
+    WHEN NOT MATCHED BY SOURCE AND T.date BETWEEN DATE '{start_date}' AND DATE '{end_date}' THEN DELETE
+    """
+    dry = client.query(merge_sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
+    print(f"Ad-level MERGE dry-run bytes: {dry.total_bytes_processed:,} ({dry.total_bytes_processed / (1024*1024):.2f} MB)")
+    client.query(merge_sql).result()
+    print(f"BigQuery MERGE complete for ad-level: {len(rows)} rows ({start_date} to {end_date}).")
+    return len(rows)
+
+
+def run_ads_for_range(token: str, bq_client, start_date: str, end_date: str) -> int:
+    """Fetch and MERGE ad-level daily insights for a date range."""
+    print(f"\n--- Ad-Level Daily Insights ({start_date} to {end_date}) ---")
+    raw_recs = fetch_meta_ad_insights(token, start_date, end_date)
+    print(f"Retrieved {len(raw_recs)} raw ad-level records from Meta.")
+    if not raw_recs:
+        return 0
+    rows = transform_ad_records(raw_recs)
+    return load_ads_into_bigquery(bq_client, rows, start_date, end_date)
+
+
 def append_daily_log(date_range: str, rows_loaded: int, spend_total: float, status: str, error_msg: str = ""):
     """Write a one-line log per run to logs/meta_daily.log with masked tokens."""
     log_dir = os.environ.get("LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
@@ -1066,6 +1219,7 @@ def main():
     parser.add_argument("--backfill-history", action="store_true", help="Run historical backup to stg_meta_ads_daily_history (earliest date to 2026-08-31)")
     parser.add_argument("--backfill-breakdowns", action="store_true", help="Backfill audience breakdowns from 2026-09-01 to yesterday")
     parser.add_argument("--backfill-segments", action="store_true", help="Backfill audience segments from 2026-09-01 to yesterday")
+    parser.add_argument("--ads-only", action="store_true", help="Run ad-level daily load (stg_meta_ads_daily_ad) only")
     
     args = parser.parse_args()
     
@@ -1122,6 +1276,21 @@ def main():
         from google.cloud import bigquery
         bq_client = bigquery.Client(credentials=get_gcp_credentials(), project=GCP_PROJECT)
         run_segments_for_range(token=token, bq_client=bq_client, start_date=s_start, end_date=s_end, dry_run=False)
+        return
+
+    # -------------------------------------------------------------------------
+    # Mode: Ad-level only (stg_meta_ads_daily_ad)
+    # -------------------------------------------------------------------------
+    if args.ads_only:
+        a_start = args.start if args.start else (yesterday - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
+        a_end = args.end if args.end else yesterday_str
+        print(f"Meta Graph API Ad-Level Load (Version: {GRAPH_API_VERSION}) | Range: {a_start} to {a_end}")
+        token = get_secret_token()
+        from google.cloud import bigquery
+        default_config = bigquery.QueryJobConfig(labels={"datacloud": "antigravity", "purpose": "meta_feed"})
+        bq_client = bigquery.Client(credentials=get_gcp_credentials(), project=GCP_PROJECT, default_query_job_config=default_config)
+        ad_rows = run_ads_for_range(token, bq_client, a_start, a_end)
+        print(f"Ad-level load complete: {ad_rows} rows.")
         return
 
     # -------------------------------------------------------------------------
@@ -1242,7 +1411,11 @@ def main():
         print("\n--- 4. Audience Segments (user_segment_key) ---")
         segment_rows_loaded = run_segments_for_range(token, bq_client, start_date, end_date, dry_run=False)
 
-        print(f"\nAll operations complete: {len(transformed_rows)} spend rows, {reach_rows_loaded} reach rows, {breakdown_rows_loaded} breakdown rows, {segment_rows_loaded} segment rows.")
+        # 5. Ad-Level Daily Insights (last 7 days by default, or specified date range)
+        print("\n--- 5. Ad-Level Daily Insights (stg_meta_ads_daily_ad) ---")
+        ad_rows_loaded = run_ads_for_range(token, bq_client, start_date, end_date)
+
+        print(f"\nAll operations complete: {len(transformed_rows)} spend rows, {reach_rows_loaded} reach rows, {breakdown_rows_loaded} breakdown rows, {segment_rows_loaded} segment rows, {ad_rows_loaded} ad rows.")
         append_daily_log(f"{start_date}..{end_date}", len(transformed_rows), total_spend, "OK")
     except Exception as e:
         safe_err = mask_token(str(e))
